@@ -1,0 +1,13 @@
+# your secrets and settings
+.env
+
+# build output
+firmware/out/
+
+# your music (only the readme is shared)
+music/*
+!music/README.txt
+
+# python
+__pycache__/
+*.pyc

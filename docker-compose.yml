@@ -1,0 +1,36 @@
+# Pi 5 side of the assistant.   Start:  docker compose up -d
+services:
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    restart: unless-stopped
+    environment:
+      - OLLAMA_KEEP_ALIVE=24h        # keep the model in RAM between questions
+      - OLLAMA_NUM_PARALLEL=1
+    volumes:
+      - ollama:/root/.ollama
+    ports:
+      - "127.0.0.1:11434:11434"      # only reachable from the Pi itself
+
+  assistant:
+    build: ./assistant
+    image: pi-esp-jarvis:latest
+    container_name: assistant
+    restart: unless-stopped
+    depends_on:
+      - ollama
+    env_file: .env
+    environment:
+      - OLLAMA_URL=http://ollama:11434
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # lets the container reach the Pi helper
+    volumes:
+      - assistant-data:/data         # Whisper + Piper models, downloaded on first start
+      - /etc/localtime:/etc/localtime:ro   # use the Pi's time zone
+      - ${MUSIC_FOLDER:-./music}:/music:ro    # your music files (optional)
+    ports:
+      - "8000:8000"                  # the ESP32 connects here
+
+volumes:
+  ollama:
+  assistant-data:

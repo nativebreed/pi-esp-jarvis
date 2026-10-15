@@ -1,0 +1,47 @@
+{
+  "_help": "What Jarvis may do on the Pi. Edit freely; changes apply immediately. Commands run as your user. 'confirm' makes Jarvis ask 'are you sure?' first.",
+
+  "apps": {
+    "browser":      {"command": ["chromium-browser"], "aliases": ["chromium", "chrome", "web browser", "the browser"], "process": "chromium"},
+    "vlc":          {"command": ["vlc"], "aliases": ["video player", "media player"], "process": "vlc"},
+    "file manager": {"command": ["pcmanfm"], "aliases": ["files", "my files"], "process": "pcmanfm"},
+    "terminal":     {"command": ["lxterminal"], "aliases": ["command line"], "process": "lxterminal"},
+    "kodi":         {"command": ["kodi"], "aliases": ["media centre", "media center"], "process": "kodi"}
+  },
+
+  "websites": {
+    "youtube": "https://www.youtube.com",
+    "netflix": "https://www.netflix.com",
+    "bbc news": "https://www.bbc.co.uk/news",
+    "bbc iplayer": "https://www.bbc.co.uk/iplayer",
+    "google": "https://www.google.com",
+    "gmail": "https://mail.google.com",
+    "spotify": "https://open.spotify.com",
+    "weather": "https://www.bbc.co.uk/weather",
+    "shopping list": "http://localhost:8000/lists"
+  },
+
+  "browser_command": null,
+
+  "actions": [
+    {"name": "reboot", "say": "reboot the Pi", "phrases": ["reboot the pi", "restart the pi", "reboot the raspberry pi", "restart the raspberry pi", "reboot the system"],
+     "command": ["sudo", "-n", "systemctl", "reboot"], "confirm": true, "delay": 5,
+     "done": "Rebooting the Pi now. I'll be back in about a minute.", "ends_session": true},
+    {"name": "shutdown", "say": "shut down the Pi", "phrases": ["shut down the pi", "shutdown the pi", "turn off the pi", "power off the pi", "shut down the raspberry pi"],
+     "command": ["sudo", "-n", "systemctl", "poweroff"], "confirm": true, "delay": 5,
+     "done": "Shutting down the Pi. Goodbye!", "ends_session": true},
+    {"name": "restart assistant", "say": "restart myself", "phrases": ["restart yourself", "restart the assistant", "reboot yourself"],
+     "command": ["docker", "restart", "assistant"], "confirm": true, "delay": 3,
+     "done": "Restarting. Give me about thirty seconds.", "ends_session": true},
+    {"name": "update", "say": "update the Pi's software", "phrases": ["update the pi", "update the system", "install updates"],
+     "command": ["sudo", "-n", "sh", "-c", "apt-get update && apt-get -y upgrade"], "confirm": true, "background": true,
+     "done": "Updating the Pi's software in the background. It can take a while."},
+    {"name": "screen off", "phrases": ["turn off the screen", "turn the screen off", "screen off"],
+     "command": ["sh", "-c", "wlopm --off '*' 2>/dev/null || xset dpms force off"], "done": "Screen off."},
+    {"name": "screen on", "phrases": ["turn on the screen", "turn the screen on", "screen on"],
+     "command": ["sh", "-c", "wlopm --on '*' 2>/dev/null || xset dpms force on"], "done": "Screen on."},
+    {"name": "backup", "say": "run the backup", "phrases": ["run the backup", "back up the pi", "start the backup"],
+     "command": ["sh", "-c", "$HOME/backup.sh"], "background": true, "enabled": false,
+     "done": "Backup started."}
+  ]
+}
