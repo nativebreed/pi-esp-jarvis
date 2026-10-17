@@ -18,7 +18,7 @@ import uuid
 
 from aiohttp import WSMsgType, web
 
-from . import config, music, sounds, web_ui
+from . import camera, config, music, sounds, web_ui
 from .brain import Brain, Conversation, is_goodbye, match_claude_trigger, sentences
 from .clock import Alert, Clock
 from .pihelper import PiHelper
@@ -72,6 +72,7 @@ CLOCK = Clock(STORE, on_alert)
 WEATHER = Weather()
 HELPER = PiHelper()
 SKILLS = Skills(STORE, CLOCK, WEATHER, HELPER)
+CAMERA = camera.Camera(STORE)
 
 SNOOZE_RE = re.compile(r"\bsnooze\b|\b(?:\d+|five|ten|fifteen|twenty)\s+more\s+minutes\b|\blater\b|\bnot yet\b", re.I)
 DISMISS_RE = re.compile(r"^\W*(?:(?:ok(?:ay)?|jarvis)[\s,]+)?(?:stop|ok(?:ay)?|thanks?|thank you|dismiss|cancel|turn (?:it )?off|"
@@ -106,6 +107,7 @@ async def health(_request: web.Request) -> web.Response:
         "local_model_ready": BRAIN.local_ready.is_set(),
         "claude_configured": BRAIN.claude_available,
         "claude_model": config.CLAUDE_MODEL,
+        "camera": CAMERA.present,
     })
 
 
@@ -286,6 +288,12 @@ class Session:
                 await self.ws.close()
                 return
 
+            if CAMERA.present:
+                cam = camera.parse_command(text)
+                if cam:
+                    await self.handle_camera(cam, text)
+                    return
+
             command = music.parse_command(text)
             if command:
                 await self.handle_music(command)
@@ -330,7 +338,8 @@ class Session:
                 pass
 
     async def answer(self, question: str, use_claude: bool, extra: str = "",
-                     filler: str | None = None) -> None:
+                     filler: str | None = None,
+                     images: list[tuple[str, bytes]] | None = None) -> None:
         self.conv.add("user", question)
         extra = "\n\n".join(p for p in (SKILLS.memory_prompt(), extra) if p)
         if use_claude and not BRAIN.claude_available:
@@ -340,7 +349,7 @@ class Session:
         if use_claude:
             log.info("[%s] -> Claude (%s): %s", self.device_id, config.CLAUDE_MODEL, question)
             tokens = BRAIN.ask_claude(list(self.conv.messages), extra=extra,
-                                      location=await WEATHER.home())
+                                      location=await WEATHER.home(), images=images)
             emotion = "cool"
         else:
             log.info("[%s] -> local (%s): %s", self.device_id, config.LOCAL_MODEL, question)
@@ -367,7 +376,8 @@ class Session:
         producer = asyncio.create_task(produce())
         try:
             filler_task = None
-            filler = filler or (config.CLAUDE_FILLER if use_claude else None)
+            if filler is None:
+                filler = config.CLAUDE_FILLER if use_claude else None
             if filler:
                 filler_task = asyncio.create_task(self.speak(filler))
             first = True
@@ -518,6 +528,107 @@ class Session:
             await self.send_json(type="tts", state="stop")
             await asyncio.sleep(0.3)
             await self.ws.close()
+
+    # ----------------------------------------------------------------- camera
+    async def handle_camera(self, cmd: camera.Command, heard: str) -> None:
+        log.info("[%s] camera command: %s", self.device_id, cmd)
+        await self.send_json(type="tts", state="start")
+        await self.camera_turn(cmd, heard)
+        await self.send_json(type="tts", state="stop")
+        self.conv.last_used = time.monotonic()
+        self.start_listening()
+
+    async def camera_turn(self, cmd: camera.Command, heard: str) -> None:
+        if cmd.kind in ("move", "centre", "goto", "around", "save") and not await CAMERA.can_move():
+            if cmd.kind in ("around", "goto") or cmd.question:
+                return await self.camera_look(cmd.question or heard)
+            await self.speak("This camera can't turn, but I can still tell you what I see.")
+            return
+
+        if cmd.kind == "list":
+            names = ["the " + s["name"] for s in CAMERA.spots()]
+            await self.speak("I can look at " + (", ".join(names[:-1]) + " and " + names[-1] if len(names) > 1
+                             else names[0]) + "." if names else
+                             "I don't have any camera positions yet. Point me somewhere and say: remember this as the door.")
+            return
+        if cmd.kind == "save":
+            CAMERA.save_spot(cmd.name)
+            await self.send_json(type="llm", emotion="happy")
+            await self.speak(f"Got it. Say look at the {cmd.name}, and I'll turn here.")
+            return
+        if cmd.kind == "forget":
+            ok = CAMERA.forget_spot(cmd.name)
+            await self.speak(f"OK, I've forgotten the {cmd.name}." if ok else f"I don't have a position called {cmd.name}.")
+            return
+
+        await self.send_json(type="llm", emotion="thinking", text="🤔")
+        if cmd.kind == "around":
+            return await self.camera_look_around(cmd.question or heard)
+        if cmd.kind == "goto":
+            spot = CAMERA.find_spot(cmd.name)
+            if not spot:  # "look at my shirt": not a saved place, just look
+                return await self.camera_look(heard)
+            say = None if cmd.question else self.speak(f"Looking at the {spot['name']}.")
+            await asyncio.gather(CAMERA.goto(spot["pan"], spot["tilt"]), *([say] if say else []))
+        elif cmd.kind == "centre":
+            say = None if cmd.question else self.speak("Looking straight ahead.")
+            await asyncio.gather(CAMERA.reset(), *([say] if say else []))
+        elif cmd.kind == "move":
+            if cmd.pan:
+                word = "left" if cmd.pan > 0 else "right"
+            else:
+                word = "up" if cmd.tilt > 0 else "down"
+            dp, dt_ = await CAMERA.move(cmd.pan, cmd.tilt)
+            if abs(dp) < 1 and abs(dt_) < 1:
+                await self.speak(f"I can't turn any further {word}.")
+                if not cmd.question:
+                    return
+            elif not cmd.question:
+                await self.send_json(type="llm", emotion="happy")
+                await self.speak(f"Looking {word}.")
+        if cmd.question:
+            await self.camera_look(cmd.question, announce=False)
+
+    async def camera_look(self, question: str, announce: bool = True) -> None:
+        """Take a photo and let Claude answer the question about it."""
+        if not BRAIN.claude_available:
+            await self.speak("I need Claude to see. Add your Claude API key to the settings to use the camera.")
+            return
+        await self.send_json(type="llm", emotion="thinking", text="🤔")
+        snap = asyncio.create_task(CAMERA.snapshot())
+        if announce:
+            await self.speak("Let me take a look.")
+        image = await snap
+        if not image:
+            await self.speak("Sorry, I couldn't get a picture from the camera.")
+            return
+        await self.answer(question, use_claude=True, extra=camera.vision_prompt(1),
+                          filler="", images=[("", image)])
+
+    async def camera_look_around(self, question: str) -> None:
+        if not BRAIN.claude_available:
+            await self.speak("I need Claude to see. Add your Claude API key to the settings to use the camera.")
+            return
+        sweep = min(45.0, CAMERA.pan_limit)
+
+        async def take_photos() -> list[tuple[str, bytes]]:
+            photos = []
+            await CAMERA.goto(sweep, 0)
+            for label, step in (("Photo 1, camera turned left:", -sweep), ("Photo 2, straight ahead:", -sweep),
+                                ("Photo 3, camera turned right:", sweep)):
+                image = await CAMERA.snapshot()
+                if image:
+                    photos.append((label, image))
+                await CAMERA.move(step, 0)   # ends back in the middle
+            return photos
+
+        photos, _ = await asyncio.gather(take_photos(), self.speak("Having a look around."))
+        if not photos:
+            await self.speak("Sorry, I couldn't get a picture from the camera.")
+            return
+        await self.answer(question, use_claude=True, filler="", images=photos,
+                          extra=camera.vision_prompt(len(photos)) + " The photos go from left to right; "
+                          "describe the room as one scene rather than photo by photo.")
 
     # ------------------------------------------------------------------ music
     async def handle_music(self, cmd: music.Command) -> None:
@@ -803,6 +914,10 @@ async def on_startup(app: web.Application) -> None:
                  asyncio.create_task(WEATHER.home())]
     log.info("Claude: %s", f"enabled ({config.CLAUDE_MODEL})" if BRAIN.claude_available
              else "not configured (set ANTHROPIC_API_KEY in .env)")
+    if CAMERA.present:
+        app["bg"].append(asyncio.create_task(CAMERA.can_move()))
+    else:
+        log.info("Camera: not connected (see docker-compose.camera.yml)")
 
 
 def make_app() -> web.Application:

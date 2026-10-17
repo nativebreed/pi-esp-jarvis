@@ -19,6 +19,7 @@ _DEFAULT: dict[str, Any] = {
     "reminders": [],   # {id, text, due}
     "memories": [],    # {id, text, created}
     "lists": {"shopping": [], "to-do": []},  # name -> [{id, text, done}]
+    "camera_spots": [],  # {id, name, pan, tilt}  saved camera positions
 }
 
 

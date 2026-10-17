@@ -77,6 +77,23 @@ else
 fi
 mkdir -p music
 
+# ------------------------------------------------------------------ camera
+CAM="$(ls /dev/v4l/by-id/*-video-index0 2>/dev/null | head -n1 || true)"
+if [ -n "$CAM" ] && ! grep -q '^COMPOSE_FILE=.*camera' .env; then
+  echo
+  note "Found a USB camera: $(basename "$CAM")"
+  read -r -p "   Let Jarvis use it (\"what do you see?\", \"look left\")? [Y/n] " USECAM
+  if [[ ! "${USECAM:-y}" =~ ^[Nn] ]]; then
+    {
+      echo
+      echo "# Camera (added by setup.sh)"
+      echo "COMPOSE_FILE=docker-compose.yml:docker-compose.camera.yml"
+      echo "CAMERA_DEVICE=$CAM"
+    } >> .env
+    note "Camera on. Describing what it sees needs a Claude API key."
+  fi
+fi
+
 # ------------------------------------------------------------------ start
 echo
 bold "Building and starting the assistant (the first time takes 10-20 minutes)..."

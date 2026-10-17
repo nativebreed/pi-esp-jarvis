@@ -70,4 +70,11 @@ BRIEFING_AFTER_ALARM = _env("BRIEFING_AFTER_ALARM", "true").lower() in ("1", "tr
 PI_HELPER_URL = _env("PI_HELPER_URL", "http://host.docker.internal:8766").rstrip("/")
 PI_HELPER_TOKEN = _env("PI_HELPER_TOKEN", "")
 
+# --- Camera (optional USB webcam; see docker-compose.camera.yml) ------------------------
+CAMERA_ENABLED = _env("CAMERA_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+CAMERA_DEVICE = _env("CAMERA_DEVICE_IN_CONTAINER", "/dev/video0")
+CAMERA_RESOLUTION = _env("CAMERA_RESOLUTION", "960x720")   # "" = camera default
+CAMERA_WARMUP_S = _env_float("CAMERA_WARMUP_S", 1.5)      # let the exposure settle
+CAMERA_PAN_INVERT = _env("CAMERA_PAN_INVERT", "false").lower() in ("1", "true", "yes", "on")
+
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")

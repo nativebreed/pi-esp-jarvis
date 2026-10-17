@@ -14,6 +14,7 @@ answer and the board speaks it back, while an animated robot face called *Visor*
 * 📝 **Lists and memory.** "Add milk to the shopping list", "remember the spare key is under the blue pot". Plus a page for your phone.
 * 🎵 **Music.** Your own files, or thousands of internet radio stations by genre or name.
 * 🍓 **Pi control.** "How's the Pi doing?", "open YouTube on the TV", "reboot the Pi".
+* 📷 **Eyes (optional).** Plug a USB webcam into the Pi and ask "what do you see?". A pan/tilt webcam can even "look left" or "look at the door".
 * 👋 **Gestures.** Double-tap the screen to talk, turn it face-down to snooze, shake it to stop.
 
 No coding needed to build it: two scripts do the work. Built with [Claude Code](https://claude.com/claude-code).
@@ -29,6 +30,7 @@ No coding needed to build it: two scripts do the work. Built with [Claude Code](
 | Official Pi 5 power supply (27 W) | Weak power supplies cause slowdowns |
 | **Waveshare ESP32-S3-Touch-AMOLED-1.8** | Revision 1 or 2 both work (V2 says "V2" on the board or box) |
 | A USB-C **data** cable | Some cables only charge; you need one that carries data |
+| *Optional:* a USB webcam | For "what do you see?". A pan/tilt one (e.g. Logitech QuickCam Orbit/Sphere) can also turn on command |
 | *Optional:* a Claude API key | From [console.anthropic.com](https://console.anthropic.com/). Without one, everything runs locally |
 
 Time: about 1 hour, mostly waiting for downloads and the firmware build.
@@ -61,7 +63,7 @@ Pi instead of the vendor's cloud, adds the Visor face and black screen, and adds
 ### Step 2 · Install Pi-Esp Jarvis on the Pi
 
 ```bash
-git clone https://github.com/YOUR-GITHUB-USERNAME/pi-esp-jarvis.git
+git clone https://github.com/nativebreed/pi-esp-jarvis.git
 cd pi-esp-jarvis
 bash setup.sh
 ```
@@ -168,6 +170,29 @@ Put your own music files (mp3, flac, m4a, ogg) in the `music` folder; subfolders
 
 Everything Jarvis can do on the Pi is listed in [`pi-helper/actions.json`](pi-helper/actions.json). Edit it to add your own apps, websites or scripts.
 
+### Camera (if you plugged in a USB webcam)
+
+`setup.sh` spots a USB webcam and asks whether Jarvis may use it. Describing the picture needs a Claude API key.
+
+| You say | What happens |
+|---|---|
+| "What do you see?" / "Can you see me?" / "What am I holding?" | Takes a photo and Claude describes it |
+| "Is anyone in the room?" / "Read this" / "How many fingers am I holding up?" | Any question about the picture |
+| "Look left" / "Look up a bit" / "Turn the camera right 45 degrees" | Turns a pan/tilt camera |
+| "Look left and tell me what you see" | Turns, then describes |
+| "Look around" | Three photos from left to right, described as one room |
+| "Remember this as the door", then later "Look at the door" | Saves where the camera points and goes back to it |
+| "Centre the camera" / "Look straight ahead" | Back to the middle |
+
+Jarvis only takes a photo when you ask, and only sends it to Claude to answer you. The last photo is kept on the Pi (in the assistant's data volume) and replaced by the next one.
+
+To add a camera later, plug it in and run `bash setup.sh` again, or add these two lines to `.env` and run `docker compose up -d`:
+
+```
+COMPOSE_FILE=docker-compose.yml:docker-compose.camera.yml
+CAMERA_DEVICE=/dev/video0
+```
+
 ### Gestures
 
 | Gesture | While ringing | While talking or playing | While idle |
@@ -199,6 +224,8 @@ Everything lives in the `.env` file. After editing it, run `docker compose up -d
 | `BRIEFING_AFTER_ALARM` | `true` | Morning briefing when you stop a morning alarm |
 | `DEFAULT_RADIO_GENRE` | `soul` | What "play music" plays if your music folder is empty |
 | `IDLE_TIMEOUT_S` | `10` | Seconds of silence before the board goes back to sleep |
+| `CAMERA_DEVICE` | – | Your webcam, e.g. `/dev/video0` (needs the `COMPOSE_FILE` line above) |
+| `CAMERA_PAN_INVERT` | `false` | Set to `true` if "look left" turns the camera right |
 
 **Firmware options** (put them before `bash flash-esp32.sh`):
 `WAKE_WORD=hiesp` (say "Hi ESP" instead of "Jarvis"), `OTA_URL=http://192.168.1.50:8000/xiaozhi/ota/` (use the Pi's IP address), `REBUILD=1` (force a fresh build).
@@ -221,6 +248,7 @@ you can set a monthly spending limit in the Claude Console. Without an API key i
 * **"No ESP32 found".** Use a data cable. If it still isn't found, unplug the board, hold **BOOT** while plugging it back in, and retry.
 * **"Permission denied" with Docker.** Log out and back in (or reboot) after the first setup, so your user can use Docker.
 * **Alarms don't wake the board.** The board must be on and on Wi-Fi. On battery it powers off after 5 minutes idle, so use USB power if you rely on alarms.
+* **"I couldn't get a picture from the camera".** Check the camera works on the Pi with `fswebcam test.jpg` and that `CAMERA_DEVICE` points at it (`ls /dev/v4l/by-id/`). Only one program can use the camera at a time.
 * **The wake word rarely triggers.** Speak from about 1 m away, or rebuild with `WAKE_WORD=hiesp REBUILD=1 bash flash-esp32.sh`.
 
 ## What's in the box
@@ -229,6 +257,7 @@ you can set a monthly spending limit in the Claude Console. Without an API key i
 setup.sh               one-command setup for the Pi
 flash-esp32.sh         builds and flashes the board firmware (in Docker)
 docker-compose.yml     the two containers: ollama (local AI) and assistant
+docker-compose.camera.yml  optional: gives the assistant your USB webcam
 .env.example           all settings (setup.sh copies this to .env)
 assistant/             the Pi server (Python): speech, router, skills, Claude, music, lists page
 pi-helper/             optional helper that lets Jarvis control the Pi (install.sh, actions.json)

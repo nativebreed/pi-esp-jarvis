@@ -6,7 +6,7 @@ ENV PYTHONUNBUFFERED=1 \
     DATA_DIR=/data
 
 RUN apt-get update \
- && apt-get install -y --no-install-recommends libopus0 ffmpeg ca-certificates tzdata \
+ && apt-get install -y --no-install-recommends libopus0 ffmpeg v4l-utils ca-certificates tzdata \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import datetime as dt
 import json
 import logging
@@ -165,9 +166,21 @@ class Brain:
                     break
 
     async def ask_claude(self, history: list[dict], extra: str = "",
-                         location: dict | None = None) -> AsyncIterator[str]:
+                         location: dict | None = None,
+                         images: list[tuple[str, bytes]] | None = None) -> AsyncIterator[str]:
+        """images: [(label, jpeg bytes)] attached to the latest question (camera photos)."""
         kwargs = {}
-        if config.CLAUDE_WEB_SEARCH:
+        if images and history and history[-1]["role"] == "user":
+            content: list[dict] = []
+            for label, jpeg in images:
+                if label:
+                    content.append({"type": "text", "text": label})
+                content.append({"type": "image", "source": {
+                    "type": "base64", "media_type": "image/jpeg",
+                    "data": base64.b64encode(jpeg).decode("ascii")}})
+            content.append({"type": "text", "text": history[-1]["content"]})
+            history = history[:-1] + [{"role": "user", "content": content}]
+        if config.CLAUDE_WEB_SEARCH and not images:
             tool = {"type": "web_search_20250305", "name": "web_search", "max_uses": 3}
             if location:
                 loc = {"type": "approximate", "city": location.get("name", "")}

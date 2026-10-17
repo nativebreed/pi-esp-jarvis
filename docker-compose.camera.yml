@@ -1,0 +1,10 @@
+# Optional: gives the assistant your USB webcam.
+# Turn it on by adding this line to .env (setup.sh does it for you if it finds a camera):
+#   COMPOSE_FILE=docker-compose.yml:docker-compose.camera.yml
+# then run:  docker compose up -d
+services:
+  assistant:
+    devices:
+      # Left side: your camera on the Pi. If you have more than one, use the
+      # stable name from:  ls /dev/v4l/by-id/   (the one ending in -video-index0)
+      - ${CAMERA_DEVICE:-/dev/video0}:/dev/video0
