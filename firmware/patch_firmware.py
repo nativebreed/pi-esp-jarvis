@@ -9,6 +9,7 @@
 * double-tap the screen to start talking (or to interrupt the answer)
 """
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -68,17 +69,30 @@ if emoji_dir and any(emoji_dir.glob("*.gif")):
           "        return default_emoji_collection\n")
     print(f"patched: face animations from {emoji_dir} ({len(list(emoji_dir.glob('*.gif')))} GIFs)")
 
-# --- 4. double-tap, wake channel and motion gestures -----------------------------------
+# --- 4. double-tap, wake channel, gestures, upright screen, dice + countdown -----------
 src = board_dir / f"{board}.cc"
+# If the picture shifts sideways when the screen flips, adjust with FLIP_OFFSET="x,y" (see README).
+flip_x, flip_y = "DISPLAY_OFFSET_X", "DISPLAY_OFFSET_Y"
+if os.environ.get("FLIP_OFFSET", "").strip():
+    fx, fy = (int(v) for v in os.environ["FLIP_OFFSET"].split(","))
+    flip_x, flip_y = str(fx), str(fy)
+# Which way is up, as the motion sensor sees it. Measured on a v2 board ("flip the screen" log:
+# axis=0 sign=1). Boards without a measurement learn it the first time they stand still.
+UPRIGHT = {"esp32-s3-touch-amoled-1.8-v2": (0, 1)}
+up_axis, up_sign = UPRIGHT.get(board, (-1, 1))
 AGENT_CODE = r"""
     // ======================================================================
     // Pi-Esp Jarvis additions
     //   * double-tap the screen to talk / interrupt
     //   * wake channel: an idle board waits on the Pi so alarms/timers can wake it
     //   * motion gestures (QMI8658): face-down = quiet/snooze, shake = stop/cancel
+    //   * upright: the screen turns 180 degrees when the board stands upside down
+    //   * screen modes drawn by the board: dice (shake to roll) and timer countdown
     // ======================================================================
     int64_t last_tap_us_ = 0;
     i2c_master_dev_handle_t imu_ = nullptr;
+    volatile float last_x_ = 0;
+    volatile float last_y_ = 0;
     volatile float last_z_ = 0;
     volatile int face_up_sign_ = 1;
 
@@ -100,6 +114,10 @@ AGENT_CODE = r"""
             return;
         }
         self->last_tap_us_ = 0;
+        if (self->dice_on_) {  // double-tap leaves dice mode
+            self->EndDice();
+            return;
+        }
         Application::GetInstance().Schedule([self]() {
             self->power_save_timer_->WakeUp();
             auto& app = Application::GetInstance();
@@ -110,7 +128,6 @@ AGENT_CODE = r"""
             }
         });
     }
-
     void InitializeDoubleTap() {
         if (!lvgl_port_lock(0)) {
             return;
@@ -237,6 +254,530 @@ AGENT_CODE = r"""
         }
     }
 
+    // ------------------------------------------------------------ upright
+    esp_lcd_panel_handle_t jv_panel_ = nullptr;
+    esp_lcd_touch_handle_t jv_touch_ = nullptr;
+    volatile bool flipped_ = false;
+    volatile int up_axis_ = -1;  // sensor axis gravity runs along when the board is upright (0 = x, 1 = y)
+    volatile int up_sign_ = 1;
+
+    // The board is the right way up for whoever is looking at it right now.
+    void LearnUpright(float x, float y) {
+        float ax = fabsf(x), ay = fabsf(y);
+        if (std::max(ax, ay) < 0.6f) {
+            return;  // lying flat: nothing to learn
+        }
+        int axis = ay > ax ? 1 : 0;
+        float v = axis ? y : x;
+        int sign = (v > 0 ? 1 : -1) * (flipped_ ? -1 : 1);
+        if (axis != up_axis_ || sign != up_sign_) {
+            up_axis_ = axis;
+            up_sign_ = sign;
+            Settings settings("agent", true);
+            settings.SetInt("up_axis", axis);
+            settings.SetInt("up_sign", sign);
+            ESP_LOGI(TAG, "Upright is axis %d, sign %d", axis, sign);
+        }
+    }
+
+    void SetFlipped(bool flip) {
+        if (jv_panel_ == nullptr || flip == flipped_) {
+            return;
+        }
+        if (!lvgl_port_lock(0)) {
+            return;
+        }
+        flipped_ = flip;
+        esp_lcd_panel_mirror(jv_panel_, DISPLAY_MIRROR_X != flip, DISPLAY_MIRROR_Y != flip);
+        lv_display_t* disp = lv_display_get_default();
+        if (disp != nullptr) {
+            lv_display_set_offset(disp, flip ? JV_FLIP_OFFSET_X : DISPLAY_OFFSET_X,
+                                  flip ? JV_FLIP_OFFSET_Y : DISPLAY_OFFSET_Y);
+        }
+        if (jv_touch_ != nullptr) {
+            esp_lcd_touch_set_mirror_x(jv_touch_, flip);
+            esp_lcd_touch_set_mirror_y(jv_touch_, flip);
+        }
+        lv_obj_invalidate(lv_screen_active());
+        lv_obj_invalidate(lv_layer_top());
+        lvgl_port_unlock();
+        ESP_LOGI(TAG, "Screen %s", flip ? "flipped" : "upright");
+    }
+
+    // ------------------------------------------------------- screen modes
+    static constexpr uint32_t kCyan = 0x28E1FF;
+    static constexpr uint32_t kAmber = 0xFFAA28;
+    static constexpr int kTop = 44;     // leave the status bar visible
+    static constexpr int kBottom = 56;  // and the caption
+    static constexpr int kBoxW = DISPLAY_WIDTH;
+    static constexpr int kBoxH = DISPLAY_HEIGHT - kTop - kBottom;
+    static constexpr int kDigH = 88, kSegT = 10, kColonW = 16;
+
+    lv_obj_t* mode_root_ = nullptr;
+    lv_obj_t* dice_[2] = {};
+    lv_obj_t* pips_[2][7] = {};
+    lv_obj_t* timer_box_ = nullptr;
+    lv_obj_t* arc_ = nullptr;
+    lv_obj_t* segs_[4][7] = {};
+    lv_obj_t* colon_[2] = {};
+    lv_obj_t* egg_ = nullptr;
+    lv_obj_t* clock_ = nullptr;
+    volatile bool dice_on_ = false;
+    bool timer_on_ = false;
+    bool modes_hidden_ = false;
+    bool caption_after_roll_ = false;
+    int dice_count_ = 1;
+    int dice_final_[2] = {1, 1};
+    int roll_frames_ = 0;
+    int digits_shown_ = 0;
+    int shown_s_ = -1;
+    int arc_value_ = -1;
+    int timer_total_s_ = 1;
+    uint32_t timer_color_ = 0;
+    int64_t dice_until_ms_ = 0;
+    int64_t timer_end_ms_ = 0;
+    int64_t timer_zero_ms_ = 0;
+    int64_t keep_awake_ms_ = 0;
+
+    static int64_t NowMs() { return esp_timer_get_time() / 1000; }
+
+    static lv_obj_t* Plain(lv_obj_t* parent) {
+        lv_obj_t* o = lv_obj_create(parent);
+        lv_obj_remove_style_all(o);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_CLICKABLE);  // taps fall through to the double-tap layer
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+        return o;
+    }
+
+    static void Neon(lv_obj_t* o, uint32_t color, int glow) {
+        lv_obj_set_style_shadow_color(o, lv_color_hex(color), 0);
+        lv_obj_set_style_shadow_width(o, glow, 0);
+        lv_obj_set_style_shadow_opa(o, LV_OPA_50, 0);
+    }
+
+    void BuildModes() {  // LVGL lock held
+        mode_root_ = Plain(lv_layer_top());
+        lv_obj_set_size(mode_root_, kBoxW, kBoxH);
+        lv_obj_set_pos(mode_root_, 0, kTop);
+        lv_obj_set_style_bg_color(mode_root_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(mode_root_, LV_OPA_COVER, 0);
+        lv_obj_add_flag(mode_root_, LV_OBJ_FLAG_HIDDEN);
+
+        for (int i = 0; i < 2; i++) {
+            lv_obj_t* d = Plain(mode_root_);
+            lv_obj_set_style_border_color(d, lv_color_hex(kCyan), 0);
+            lv_obj_set_style_border_opa(d, LV_OPA_COVER, 0);
+            Neon(d, kCyan, 26);
+            lv_obj_set_style_transform_pivot_x(d, LV_PCT(50), 0);
+            lv_obj_set_style_transform_pivot_y(d, LV_PCT(50), 0);
+            for (int k = 0; k < 7; k++) {
+                lv_obj_t* pip = Plain(d);
+                lv_obj_set_style_radius(pip, LV_RADIUS_CIRCLE, 0);
+                lv_obj_set_style_bg_color(pip, lv_color_hex(kCyan), 0);
+                lv_obj_set_style_bg_opa(pip, LV_OPA_COVER, 0);
+                Neon(pip, kCyan, 14);
+                pips_[i][k] = pip;
+            }
+            dice_[i] = d;
+        }
+
+        timer_box_ = Plain(mode_root_);
+        lv_obj_set_size(timer_box_, kBoxW, kBoxH);
+        arc_ = lv_arc_create(timer_box_);
+        lv_obj_remove_flag(arc_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(arc_, 300, 300);
+        lv_obj_align(arc_, LV_ALIGN_CENTER, 0, 0);
+        lv_arc_set_rotation(arc_, 270);
+        lv_arc_set_bg_angles(arc_, 0, 360);
+        lv_arc_set_range(arc_, 0, 1000);
+        lv_obj_set_style_bg_opa(arc_, LV_OPA_TRANSP, 0);
+        lv_obj_set_style_pad_all(arc_, 0, 0);
+        lv_obj_set_style_arc_width(arc_, 14, LV_PART_MAIN);
+        lv_obj_set_style_arc_width(arc_, 14, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_opa(arc_, LV_OPA_20, LV_PART_MAIN);
+        lv_obj_set_style_arc_opa(arc_, LV_OPA_COVER, LV_PART_INDICATOR);
+        lv_obj_set_style_arc_rounded(arc_, true, LV_PART_INDICATOR);
+        lv_obj_set_style_pad_all(arc_, 4, LV_PART_KNOB);
+        lv_obj_set_style_bg_opa(arc_, LV_OPA_COVER, LV_PART_KNOB);
+        lv_obj_set_style_radius(arc_, LV_RADIUS_CIRCLE, LV_PART_KNOB);
+        lv_obj_set_style_shadow_width(arc_, 16, LV_PART_KNOB);
+        lv_obj_set_style_shadow_opa(arc_, LV_OPA_60, LV_PART_KNOB);
+
+        for (auto& digit : segs_) {
+            for (auto& seg : digit) {
+                seg = Plain(timer_box_);
+                lv_obj_set_style_radius(seg, kSegT / 2, 0);
+                lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+            }
+        }
+        for (auto& dot : colon_) {
+            dot = Plain(timer_box_);
+            lv_obj_set_size(dot, 11, 11);
+            lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        }
+        egg_ = Plain(timer_box_);  // egg timers
+        lv_obj_set_size(egg_, 46, 58);
+        lv_obj_set_style_radius(egg_, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(egg_, 4, 0);
+        lv_obj_set_style_bg_opa(egg_, LV_OPA_20, 0);
+        lv_obj_align(egg_, LV_ALIGN_CENTER, 0, 84);
+        clock_ = Plain(timer_box_);  // every other timer
+        lv_obj_set_size(clock_, 48, 48);
+        lv_obj_set_style_radius(clock_, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(clock_, 4, 0);
+        lv_obj_align(clock_, LV_ALIGN_CENTER, 0, 84);
+        for (int h = 0; h < 2; h++) {
+            lv_obj_t* hand = Plain(clock_);
+            lv_obj_set_size(hand, h ? 12 : 4, h ? 4 : 16);
+            lv_obj_set_style_radius(hand, 2, 0);
+            lv_obj_set_style_bg_opa(hand, LV_OPA_COVER, 0);
+            lv_obj_align(hand, LV_ALIGN_CENTER, h ? 5 : 0, h ? 0 : -6);
+        }
+        SetTimerColor(kCyan);
+        lv_timer_create(ModeTick, 70, this);
+    }
+
+    void SetTimerColor(uint32_t color) {
+        if (color == timer_color_) {
+            return;
+        }
+        timer_color_ = color;
+        lv_color_t c = lv_color_hex(color);
+        lv_obj_set_style_arc_color(arc_, c, LV_PART_MAIN);
+        lv_obj_set_style_arc_color(arc_, c, LV_PART_INDICATOR);
+        lv_obj_set_style_bg_color(arc_, c, LV_PART_KNOB);
+        lv_obj_set_style_shadow_color(arc_, c, LV_PART_KNOB);
+        for (auto& digit : segs_) {
+            for (auto* seg : digit) {
+                lv_obj_set_style_bg_color(seg, c, 0);
+            }
+        }
+        for (auto* dot : colon_) {
+            lv_obj_set_style_bg_color(dot, c, 0);
+        }
+        for (lv_obj_t* icon : {egg_, clock_}) {
+            lv_obj_set_style_border_color(icon, c, 0);
+            lv_obj_set_style_bg_color(icon, c, 0);
+            for (uint32_t i = 0; i < lv_obj_get_child_count(icon); i++) {
+                lv_obj_set_style_bg_color(lv_obj_get_child(icon, i), c, 0);
+            }
+        }
+    }
+
+    void LayoutDigits(int n) {  // n digits with the colon before the last two
+        if (n == digits_shown_) {
+            return;
+        }
+        digits_shown_ = n;
+        const int h = n >= 4 ? 70 : kDigH;  // four digits get smaller so they stay inside the ring
+        const int w = h * 52 / 100, t = std::max(8, h * 114 / 1000), in = h * 9 / 100;
+        const int half = h / 2 - h * 136 / 1000, gap = h * 11 / 100;
+        const int total = n * w + kColonW + n * gap;
+        int x = (kBoxW - total) / 2;
+        const int top = kBoxH / 2 - 10 - h / 2;
+        for (int d = 0; d < 4; d++) {
+            bool used = d < n;
+            for (auto* seg : segs_[d]) {
+                if (used) {
+                    lv_obj_remove_flag(seg, LV_OBJ_FLAG_HIDDEN);
+                } else {
+                    lv_obj_add_flag(seg, LV_OBJ_FLAG_HIDDEN);
+                }
+                lv_obj_set_style_radius(seg, t / 2, 0);
+            }
+            if (!used) {
+                continue;
+            }
+            if (d == n - 2) {  // the colon sits before the last two digits
+                for (int k = 0; k < 2; k++) {
+                    lv_obj_set_pos(colon_[k], x + (kColonW - 11) / 2, top + h / 2 + (k ? h / 6 : -h / 6 - 11));
+                }
+                x += kColonW + gap;
+            }
+            // segments a b c d e f g
+            const int geo[7][4] = {{in, 0, w - 2 * in, t},           {w - t, in, t, half},
+                                   {w - t, h / 2 + in / 2, t, half}, {in, h - t, w - 2 * in, t},
+                                   {0, h / 2 + in / 2, t, half},     {0, in, t, half},
+                                   {in, h / 2 - t / 2, w - 2 * in, t}};
+            for (int k = 0; k < 7; k++) {
+                lv_obj_set_pos(segs_[d][k], x + geo[k][0], top + geo[k][1]);
+                lv_obj_set_size(segs_[d][k], geo[k][2], geo[k][3]);
+            }
+            x += w + gap;
+        }
+    }
+
+    void ShowTime(int left) {
+        char buf[32];
+        left = std::clamp(left, 0, 99 * 3600);
+        if (left >= 3600) {
+            snprintf(buf, sizeof(buf), "%d:%02d", left / 3600, (left / 60) % 60);
+        } else {
+            snprintf(buf, sizeof(buf), "%d:%02d", left / 60, left % 60);
+        }
+        static const uint8_t kSeg[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+        int n = 0;
+        int digits[4] = {};
+        for (const char* p = buf; *p && n < 4; p++) {
+            if (*p >= '0' && *p <= '9') {
+                digits[n++] = *p - '0';
+            }
+        }
+        LayoutDigits(n);
+        for (int d = 0; d < n; d++) {
+            for (int k = 0; k < 7; k++) {
+                lv_obj_set_style_bg_opa(segs_[d][k], (kSeg[digits[d]] >> k) & 1 ? LV_OPA_COVER : LV_OPA_10, 0);
+            }
+        }
+        SetTimerColor(left <= 60 && timer_total_s_ > 60 ? kAmber : kCyan);
+    }
+
+    void LayoutDie(int i, int size, int cx, int cy) {
+        lv_obj_t* d = dice_[i];
+        lv_obj_set_size(d, size, size);
+        lv_obj_set_pos(d, cx - size / 2, cy - size / 2);
+        lv_obj_set_style_radius(d, size * 17 / 100, 0);
+        lv_obj_set_style_border_width(d, std::max(5, size * 35 / 1000), 0);
+        static const int8_t kSlot[7][2] = {{-1, -1}, {1, -1}, {-1, 0}, {0, 0}, {1, 0}, {-1, 1}, {1, 1}};
+        int pip = size * 17 / 100, off = size * 26 / 100;
+        for (int k = 0; k < 7; k++) {
+            lv_obj_set_size(pips_[i][k], pip, pip);
+            lv_obj_align(pips_[i][k], LV_ALIGN_CENTER, kSlot[k][0] * off, kSlot[k][1] * off);
+        }
+    }
+
+    void ShowFace(int i, int value) {
+        static const uint8_t kFace[7] = {0, 0x08, 0x41, 0x49, 0x63, 0x6B, 0x77};
+        for (int k = 0; k < 7; k++) {
+            if ((kFace[value] >> k) & 1) {
+                lv_obj_remove_flag(pips_[i][k], LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(pips_[i][k], LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+    }
+
+    void StartDice(int count, int a, int b, bool caption) {  // LVGL lock held
+        dice_count_ = count;
+        dice_final_[0] = a;
+        dice_final_[1] = b;
+        if (count == 1) {
+            LayoutDie(0, 210, kBoxW / 2, kBoxH / 2);
+            lv_obj_add_flag(dice_[1], LV_OBJ_FLAG_HIDDEN);
+        } else {
+            LayoutDie(0, 150, kBoxW / 2 - 88, kBoxH / 2 - 10);
+            LayoutDie(1, 150, kBoxW / 2 + 88, kBoxH / 2 + 10);
+            lv_obj_remove_flag(dice_[1], LV_OBJ_FLAG_HIDDEN);
+        }
+        roll_frames_ = 12;
+        caption_after_roll_ = caption;
+        dice_on_ = true;
+        dice_until_ms_ = NowMs() + 30000;
+        modes_hidden_ = false;
+        UpdateModes();
+    }
+
+    void RollLocal() {  // shake while the dice are showing
+        if (!lvgl_port_lock(0)) {
+            return;
+        }
+        StartDice(dice_count_, 1 + esp_random() % 6, 1 + esp_random() % 6, true);
+        lvgl_port_unlock();
+    }
+
+    void EndDice() {  // LVGL lock held
+        dice_on_ = false;
+        UpdateModes();
+    }
+
+    void StartTimer(int seconds, int total, const std::string& label, bool egg) {  // LVGL lock held
+        timer_total_s_ = std::max(1, std::max(total, seconds));
+        timer_end_ms_ = NowMs() + seconds * 1000LL;
+        timer_zero_ms_ = 0;
+        shown_s_ = -1;
+        arc_value_ = -1;
+        if (egg) {
+            lv_obj_remove_flag(egg_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(clock_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_add_flag(egg_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(clock_, LV_OBJ_FLAG_HIDDEN);
+        }
+        timer_on_ = true;
+        modes_hidden_ = false;
+        if (!label.empty()) {
+            display_->SetChatMessage("system", label.c_str());
+        }
+        UpdateModes();
+    }
+
+    void UpdateModes() {  // LVGL lock held
+        bool show = !modes_hidden_ && (dice_on_ || timer_on_);
+        if (!show) {
+            lv_obj_add_flag(mode_root_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
+        for (auto* d : dice_) {
+            if (!dice_on_) {
+                lv_obj_add_flag(d, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (dice_on_) {
+            lv_obj_remove_flag(dice_[0], LV_OBJ_FLAG_HIDDEN);
+            lv_obj_add_flag(timer_box_, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_remove_flag(timer_box_, LV_OBJ_FLAG_HIDDEN);
+        }
+        lv_obj_remove_flag(mode_root_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(mode_root_);
+    }
+
+    static void ModeTick(lv_timer_t* t) {
+        static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(lv_timer_get_user_data(t))->Tick();
+    }
+
+    void Tick() {  // runs in the LVGL task every 70 ms
+        int64_t now = NowMs();
+        if (dice_on_) {
+            if (roll_frames_ > 0) {
+                roll_frames_--;
+                for (int i = 0; i < dice_count_; i++) {
+                    int angle;
+                    if (roll_frames_ == 0) {
+                        ShowFace(i, dice_final_[i]);
+                        angle = dice_count_ == 1 ? 0 : (i ? 60 : -80);
+                    } else {
+                        ShowFace(i, 1 + esp_random() % 6);
+                        angle = (int)(esp_random() % 700) - 350;
+                    }
+                    lv_obj_set_style_transform_rotation(dice_[i], angle, 0);
+                }
+                if (roll_frames_ == 0 && caption_after_roll_) {
+                    char text[96];
+                    if (dice_count_ == 1) {
+                        snprintf(text, sizeof(text), "You rolled a %d", dice_final_[0]);
+                    } else {
+                        snprintf(text, sizeof(text), "%d and %d - that's %d", dice_final_[0], dice_final_[1],
+                                 dice_final_[0] + dice_final_[1]);
+                    }
+                    display_->SetChatMessage("system", text);
+                }
+            } else if (now > dice_until_ms_) {
+                EndDice();
+            }
+        }
+        if (timer_on_) {
+            int64_t left_ms = std::max<int64_t>(0, timer_end_ms_ - now);
+            int left = (int)((left_ms + 999) / 1000);
+            if (left != shown_s_) {
+                shown_s_ = left;
+                ShowTime(left);
+            }
+            int value = (int)(left_ms * 1000 / (timer_total_s_ * 1000LL));
+            if (value != arc_value_) {
+                arc_value_ = value;
+                lv_arc_set_value(arc_, value);
+            }
+            if (left_ms == 0) {
+                if (timer_zero_ms_ == 0) {
+                    timer_zero_ms_ = now;
+                } else if (now - timer_zero_ms_ > 120000) {  // nobody stopped it: back to Visor
+                    timer_on_ = false;
+                    UpdateModes();
+                }
+            }
+        }
+        if ((dice_on_ || timer_on_) && !modes_hidden_ && now - keep_awake_ms_ > 5000) {
+            keep_awake_ms_ = now;
+            power_save_timer_->WakeUp();  // keep the screen on while there's something to see
+        }
+    }
+
+    // "The screen is upside down": turn it round now and remember that for this way of standing.
+    std::string FixFlip() {
+        bool want = !flipped_;
+        float x = last_x_, y = last_y_;
+        if (std::max(fabsf(x), fabsf(y)) >= 0.6f) {
+            int axis = fabsf(y) > fabsf(x) ? 1 : 0;
+            float v = axis ? y : x;
+            up_axis_ = axis;
+            up_sign_ = (v > 0 ? 1 : -1) * (want ? -1 : 1);
+        } else if (up_axis_ >= 0) {
+            up_sign_ = -up_sign_;  // lying flat: just swap what counts as up
+        }
+        if (up_axis_ >= 0) {
+            Settings settings("agent", true);
+            settings.SetInt("up_axis", up_axis_);
+            settings.SetInt("up_sign", up_sign_);
+        }
+        SetFlipped(want);
+        char status[64];
+        snprintf(status, sizeof(status), "axis=%d sign=%d flipped=%d", (int)up_axis_, (int)up_sign_, want ? 1 : 0);
+        ESP_LOGI(TAG, "Flip fixed: %s", status);
+        return status;
+    }
+
+    ReturnValue ScreenCommand(const std::string& mode, int a, int b, int count, int seconds, int total,
+                              const std::string& label, const std::string& icon) {
+        if (mode == "flip_fix") {
+            return FixFlip();
+        }
+        if (mode == "orientation") {
+            char status[64];
+            snprintf(status, sizeof(status), "axis=%d sign=%d flipped=%d", (int)up_axis_, (int)up_sign_,
+                     flipped_ ? 1 : 0);
+            return std::string(status);
+        }
+        if (mode_root_ == nullptr || !lvgl_port_lock(1000)) {
+            return false;
+        }
+        if (mode == "dice") {
+            StartDice(std::clamp(count, 1, 2), std::clamp(a, 1, 6), std::clamp(b, 1, 6), false);
+        } else if (mode == "dice_off") {
+            dice_on_ = false;
+        } else if (mode == "timer") {
+            StartTimer(std::max(0, seconds), total, label, icon == "egg");
+        } else if (mode == "timer_off") {
+            timer_on_ = false;
+        } else if (mode == "hide") {
+            modes_hidden_ = true;
+        } else if (mode == "show") {
+            modes_hidden_ = false;
+        } else if (mode == "off") {
+            dice_on_ = false;
+            timer_on_ = false;
+            modes_hidden_ = false;
+        }
+        UpdateModes();
+        lvgl_port_unlock();
+        return true;
+    }
+
+    void InitializeScreenModes() {
+        if (lvgl_port_lock(0)) {
+            BuildModes();
+            lvgl_port_unlock();
+        }
+        McpServer::GetInstance().AddTool(
+            "self.jarvis.screen",
+            "Pi-Esp Jarvis screen modes, used by the Pi server: mode = dice | dice_off | timer | timer_off | "
+            "hide | show | off | flip_fix | orientation.",
+            PropertyList({Property("mode", kPropertyTypeString),
+                          Property("a", kPropertyTypeInteger, 1),
+                          Property("b", kPropertyTypeInteger, 1),
+                          Property("count", kPropertyTypeInteger, 1),
+                          Property("seconds", kPropertyTypeInteger, 0),
+                          Property("total", kPropertyTypeInteger, 0),
+                          Property("label", kPropertyTypeString, std::string("")),
+                          Property("icon", kPropertyTypeString, std::string("timer"))}),
+            [this](const PropertyList& p) -> ReturnValue {
+                return ScreenCommand(p["mode"].value<std::string>(), p["a"].value<int>(), p["b"].value<int>(),
+                                     p["count"].value<int>(), p["seconds"].value<int>(), p["total"].value<int>(),
+                                     p["label"].value<std::string>(), p["icon"].value<std::string>());
+            });
+    }
+
     static void GestureTask(void* arg) {
         auto* self = static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(arg);
         const float lsb_per_g = 8192.0f;  // +-4 g range
@@ -245,6 +786,9 @@ AGENT_CODE = r"""
         int shake_hits = 0;
         int64_t shake_window = 0;
         int64_t last_shake = 0;
+        int stand_ms = 0;
+        int flip_ms = 0;
+        int unflip_ms = 0;
         while (true) {
             vTaskDelay(pdMS_TO_TICKS(50));
             uint8_t raw[6];
@@ -254,9 +798,42 @@ AGENT_CODE = r"""
             float x = (int16_t)(raw[0] | (raw[1] << 8)) / lsb_per_g;
             float y = (int16_t)(raw[2] | (raw[3] << 8)) / lsb_per_g;
             float z = (int16_t)(raw[4] | (raw[5] << 8)) / lsb_per_g;
+            self->last_x_ = x;
+            self->last_y_ = y;
             self->last_z_ = z;
             float mag = sqrtf(x * x + y * y + z * z);
+            bool steady = fabsf(mag - 1.0f) < 0.2f;
             int64_t now_ms = esp_timer_get_time() / 1000;
+
+            // Upright: turn the screen 180 degrees while the board stands upside down.
+            if (self->up_axis_ < 0) {
+                // Not learned yet: the first time it stands still, call that upright.
+                if (steady && std::max(fabsf(x), fabsf(y)) > 0.8f) {
+                    stand_ms += 50;
+                    if (stand_ms >= 2000) {
+                        self->LearnUpright(x, y);
+                    }
+                } else {
+                    stand_ms = 0;
+                }
+            } else {
+                float g = (self->up_axis_ ? y : x) * self->up_sign_;
+                if (steady && g < -0.6f) {
+                    unflip_ms = 0;
+                    flip_ms += 50;
+                    if (flip_ms >= 750 && !self->flipped_) {
+                        self->SetFlipped(true);
+                    }
+                } else if (steady && g > 0.6f) {
+                    flip_ms = 0;
+                    unflip_ms += 50;
+                    if (unflip_ms >= 750 && self->flipped_) {
+                        self->SetFlipped(false);
+                    }
+                } else {
+                    flip_ms = unflip_ms = 0;  // lying flat or moving: keep it as it is
+                }
+            }
 
             // Face down: screen towards the table and still for 0.7 s.
             float facing = z * self->face_up_sign_;
@@ -271,16 +848,20 @@ AGENT_CODE = r"""
                 down_sent = false;  // picked up again: ready for the next time
             }
 
-            // Shake: several strong jolts within one second.
+            // Shake: several strong jolts within one second (rolls the dice in dice mode).
             if (fabsf(mag - 1.0f) > 1.2f) {
                 if (now_ms - shake_window > 1000) {
                     shake_window = now_ms;
                     shake_hits = 0;
                 }
-                if (++shake_hits >= 4 && now_ms - last_shake > 2500) {
+                if (++shake_hits >= 4 && now_ms - last_shake > (self->dice_on_ ? 1200 : 2500)) {
                     last_shake = now_ms;
                     shake_hits = 0;
-                    self->SendGesture("shake");
+                    if (self->dice_on_) {
+                        self->RollLocal();
+                    } else {
+                        self->SendGesture("shake");
+                    }
                 }
             }
         }
@@ -289,9 +870,12 @@ AGENT_CODE = r"""
     void InitializeAgentExtras() {
         Settings settings("agent", false);
         face_up_sign_ = settings.GetInt("face_up", 1) < 0 ? -1 : 1;
+        up_axis_ = settings.GetInt("up_axis", JV_UP_AXIS);  // board default; "flip the screen" overrides it
+        up_sign_ = settings.GetInt("up_sign", JV_UP_SIGN) < 0 ? -1 : 1;
+        InitializeScreenModes();
         xTaskCreate(WakeChannelTask, "wake_channel", 6144, this, 2, nullptr);
         if (InitializeImu()) {
-            xTaskCreate(GestureTask, "gestures", 3072, this, 2, nullptr);
+            xTaskCreate(GestureTask, "gestures", 4096, this, 2, nullptr);
         }
     }
 
@@ -309,7 +893,19 @@ if "InitializeAgentExtras" not in text:
     text, n = re.subn(r"\n(\s*)InitializeTools\(\);\n", r"\n\1InitializeTools();\n        InitializeAgentExtras();\n", text, count=1)
     if n != 1:
         sys.exit(f"patch_firmware: InitializeTools() call not found in {src}")
-    extra_inc = "#include <esp_timer.h>\n#include <cmath>\n#include <memory>\n#include <string>\n#include \"system_info.h\""
+    text, n = re.subn(r"\n(\s*)esp_lcd_panel_disp_on_off\(panel, true\);\n",
+                      r"\n\1esp_lcd_panel_disp_on_off(panel, true);\n\1jv_panel_ = panel;\n", text, count=1)
+    if n != 1:
+        sys.exit(f"patch_firmware: display setup not found in {src}")
+    text, n = re.subn(r"(\n(\s*)ESP_ERROR_CHECK\(esp_lcd_touch_new_i2c_\w+\(tp_io_handle, &tp_cfg, &tp\)\);\n)",
+                      r"\1\2jv_touch_ = tp;\n", text, count=1)
+    if n != 1:
+        sys.exit(f"patch_firmware: touch setup not found in {src}")
+    extra_inc = ("#include <esp_timer.h>\n#include <esp_random.h>\n#include <algorithm>\n#include <cmath>\n"
+                 "#include <cstdio>\n#include <memory>\n#include <string>\n#include \"system_info.h\"\n"
+                 "#include \"mcp_server.h\"\n"
+                 f"#define JV_FLIP_OFFSET_X {flip_x}\n#define JV_FLIP_OFFSET_Y {flip_y}\n"
+                 f"#define JV_UP_AXIS {up_axis}\n#define JV_UP_SIGN {up_sign}")
     text = text.replace("#include <lvgl.h>", "#include <lvgl.h>\n" + extra_inc, 1)
     src.write_text(text, encoding="utf-8")
-print("patched: double-tap to talk, wake channel, motion gestures")
+print("patched: double-tap, wake channel, gestures, upright screen, dice and timer screens")

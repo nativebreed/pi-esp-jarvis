@@ -9,6 +9,7 @@
 #   OTA_URL=http://<pi>:8000/xiaozhi/ota/   # default: this Pi's hostname.local
 #   PORT=/dev/ttyACM0           # default: auto-detect
 #   REBUILD=1                   # force a fresh firmware build
+#   FLIP_OFFSET=16,0            # only if the picture sits off-centre when the screen flips
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -25,13 +26,13 @@ mkdir -p "$OUT"
 # ---------------------------------------------------------------- build
 # rebuild automatically when the settings or any firmware customisation change
 FW_HASH="$(cat firmware/Dockerfile firmware/fw.sh firmware/patch_firmware.py firmware/face/emoji/*.gif | sha1sum | cut -c1-12)"
-STAMP="$VARIANT|$WAKE_WORD|$OTA_URL|$FW_HASH"
+STAMP="$VARIANT|$WAKE_WORD|$OTA_URL|${FLIP_OFFSET:-}|$FW_HASH"
 if [ "${REBUILD:-0}" = "1" ] || [ ! -f "$OUT/firmware.bin" ] || [ "$(cat "$OUT/stamp" 2>/dev/null)" != "$STAMP" ]; then
   echo "==> Building firmware (first time takes 20-30 minutes on a Pi 5)"
   $DOCKER build -t "$IMAGE" firmware
   rm -f "$OUT/firmware.bin" "$OUT/stamp"
   $DOCKER run --rm \
-    -e BOARD_VARIANT="$VARIANT" -e WAKE_WORD="$WAKE_WORD" -e OTA_URL="$OTA_URL" \
+    -e BOARD_VARIANT="$VARIANT" -e WAKE_WORD="$WAKE_WORD" -e OTA_URL="$OTA_URL" -e FLIP_OFFSET="${FLIP_OFFSET:-}" \
     -v "$OUT:/out" -v esp32-fw-cache:/root/.cache \
     "$IMAGE" build
   echo "$STAMP" > "$OUT/stamp"

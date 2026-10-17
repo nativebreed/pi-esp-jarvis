@@ -120,6 +120,9 @@ class Clock:
     # ======================================================== understanding requests
     def handle(self, text: str) -> Reply | None:
         low = text.lower()
+        egg = self._egg(text, low)
+        if egg:
+            return egg
         if re.search(r"\btimers?\b", low) or (re.search(r"\b(how (much time|long)( is)? left|time left)\b", low)
                                               and self.store.items("timers")):
             return self._timers(text, low)
@@ -160,6 +163,25 @@ class Clock:
             return Reply("You don't have any timers running.")
         return Reply(self._timer_list(timers, with_left=True).capitalize() + ".")
 
+    # Egg timer presets: "boil an egg", "soft-boiled egg timer", "hard boiled eggs"
+    _EGG_RE = re.compile(r"\b(?:(?P<kind>soft|medium|hard|runny|dippy|jammy)[\s-]*boiled\s+eggs?|"
+                         r"boil(?:ing)?\s+(?:an?\s+|some\s+|two\s+|three\s+|four\s+|the\s+|my\s+)?eggs?|"
+                         r"eggs?\s+timer|(?P<kind2>soft|medium|hard|runny|dippy|jammy)\s+eggs?)\b")
+    _EGG_TIMES = {"soft": 360, "runny": 300, "dippy": 300, "jammy": 420, "medium": 480, "hard": 600}
+
+    def _egg(self, text: str, low: str) -> Reply | None:
+        m = self._EGG_RE.search(low)
+        if not m or re.search(_CANCEL, low) or re.search(r"\b(how (much|long)|left|remaining)\b", low):
+            return None
+        kind = m.group("kind") or m.group("kind2") or ""
+        seconds = parse_duration(text) or self._EGG_TIMES.get(kind, 360)
+        label = f"{kind}-boiled egg" if kind else "egg"
+        self.store.add("timers", {"label": label, "due": time.time() + seconds, "duration": seconds})
+        msg = f"OK, {label} timer set for {say_duration(seconds)}."
+        if not kind and not parse_duration(text):
+            msg += " That's soft-boiled. Say hard-boiled egg for ten minutes."
+        return Reply(msg, emotion="timer")
+
     @staticmethod
     def _timer_label(low: str) -> str:
         m = re.search(r"\b(?:an?|the|my)\s+(?!\d)([a-z][a-z ]{1,24}?)\s+timer\b", low)
@@ -172,9 +194,15 @@ class Clock:
 
     @staticmethod
     def _label_match(low: str, items: list[dict]) -> str | None:
-        for it in items:
-            label = (it.get("label") or "").lower()
+        low = low.replace("-", " ")
+        for it in sorted(items, key=lambda i: -len(i.get("label") or "")):  # longest name first
+            label = (it.get("label") or "").lower().replace("-", " ")
             if label and label in low:
+                return it.get("label")
+        words = set(re.findall(r"[a-z]+", low))
+        for it in items:  # "cancel the egg timer" finds "soft-boiled egg"
+            last = (it.get("label") or "").lower().split(" ")[-1]
+            if len(last) >= 3 and last in words:
                 return it.get("label")
         return None
 

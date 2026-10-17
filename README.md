@@ -16,6 +16,8 @@ answer and the board speaks it back, while an animated robot face called *Visor*
 * 🍓 **Pi control.** "How's the Pi doing?", "open YouTube on the TV", "reboot the Pi".
 * 📷 **Eyes (optional).** Plug a USB webcam into the Pi and ask "what do you see?". A pan/tilt webcam can even "look left" or "look at the door".
 * 👋 **Gestures.** Double-tap the screen to talk, turn it face-down to snooze, shake it to stop.
+* 🎲 **Dice and countdowns.** "Roll two dice" tumbles them on screen (shake to roll again); every timer shows a live countdown ring.
+* 🔄 **Always upright.** Stand the board upside down and the screen turns round to match.
 
 No coding needed to build it: two scripts do the work. Built with [Claude Code](https://claude.com/claude-code).
 
@@ -125,6 +127,15 @@ Try: *"Jarvis… what's the weather tomorrow?"*, *"Set a timer for 5 minutes"*, 
 | "What alarms do I have?" / "Turn off my 7 AM alarm" | Lists or cancels alarms |
 | "Remind me to call Mum at 6" / "Remind me in 20 minutes to check the oven" | Sets a reminder |
 
+While a timer runs, the screen shows a **countdown ring** that drains as time passes and turns amber in the last minute
+(egg timers get a little egg). It keeps counting even after Jarvis goes quiet.
+
+| You say | What happens |
+|---|---|
+| "Boil an egg" / "Soft-boiled egg timer" | 6-minute egg timer |
+| "Hard-boiled egg" / "Medium-boiled egg" / "Jammy egg" | 10, 8 or 7 minutes |
+| "Egg timer for 4 minutes" | Your own time |
+
 When something is due, the board **wakes up by itself**, chimes and says what it's for.
 To stop it, double-tap the screen (or say "Jarvis"), then say **"stop"** or **"snooze"**. You can also turn it face-down to snooze, or shake it to stop.
 Stopping a morning alarm with "stop" plays your morning briefing.
@@ -193,6 +204,15 @@ COMPOSE_FILE=docker-compose.yml:docker-compose.camera.yml
 CAMERA_DEVICE=/dev/video0
 ```
 
+### Dice
+
+| You say | What happens |
+|---|---|
+| "Roll a dice" / "Roll two dice" | Neon dice tumble on the screen and Jarvis says the result |
+| "Roll again" | Same number of dice again |
+| *Shake the board* (while the dice are showing) | Rolls again, and the caption shows the result |
+| "Done" / *double-tap* | Back to Visor (it also goes back by itself after 30 seconds) |
+
 ### Gestures
 
 | Gesture | While ringing | While talking or playing | While idle |
@@ -202,6 +222,11 @@ CAMERA_DEVICE=/dev/video0
 | **Shake** | Stops it | Goes quiet | Cancels running timers |
 
 The board learns which way up its screen is the first time you tap it while it's lying flat.
+
+**Always upright.** Stand the board on its other end and the picture (and touch) turns 180° after about a second, so Visor
+is never upside down. Lying flat, it keeps whichever way it last was. A V2 board knows which way is up out of the box; a V1
+board learns it the first time it stands still after flashing, so stand it the right way up then. If it ever gets it backwards, stand it the right way up and say
+**"Jarvis, flip the screen"** (or "the screen is upside down"): it turns round and remembers.
 
 ---
 
@@ -228,7 +253,8 @@ Everything lives in the `.env` file. After editing it, run `docker compose up -d
 | `CAMERA_PAN_INVERT` | `false` | Set to `true` if "look left" turns the camera right |
 
 **Firmware options** (put them before `bash flash-esp32.sh`):
-`WAKE_WORD=hiesp` (say "Hi ESP" instead of "Jarvis"), `OTA_URL=http://192.168.1.50:8000/xiaozhi/ota/` (use the Pi's IP address), `REBUILD=1` (force a fresh build).
+`WAKE_WORD=hiesp` (say "Hi ESP" instead of "Jarvis"), `OTA_URL=http://192.168.1.50:8000/xiaozhi/ota/` (use the Pi's IP address), `REBUILD=1` (force a fresh build),
+`FLIP_OFFSET=16,0` (only if the picture is off-centre when the screen turns upside down).
 
 **Change the face:** the animations are GIFs in [`firmware/face/emoji/`](firmware/face/emoji), one per mood, 240 × 240 px.
 Replace them with your own (same file names) or tweak [`character.py`](firmware/face/character.py), then run the flash script again.
@@ -249,6 +275,9 @@ you can set a monthly spending limit in the Claude Console. Without an API key i
 * **"Permission denied" with Docker.** Log out and back in (or reboot) after the first setup, so your user can use Docker.
 * **Alarms don't wake the board.** The board must be on and on Wi-Fi. On battery it powers off after 5 minutes idle, so use USB power if you rely on alarms.
 * **"I couldn't get a picture from the camera".** Check the camera works on the Pi with `fswebcam test.jpg` and that `CAMERA_DEVICE` points at it (`ls /dev/v4l/by-id/`). Only one program can use the camera at a time.
+* **Visor is upside down when the board stands normally.** Say "Jarvis, flip the screen" with the board the right way up.
+* **After the screen flips, the picture sits a little off-centre.** Some screens need a different offset when turned round.
+  Reflash with e.g. `FLIP_OFFSET=16,0 bash flash-esp32.sh v2` (try `0,0`, `16,0` or `26,0` until it's centred).
 * **The wake word rarely triggers.** Speak from about 1 m away, or rebuild with `WAKE_WORD=hiesp REBUILD=1 bash flash-esp32.sh`.
 
 ## What's in the box

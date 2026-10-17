@@ -12,13 +12,14 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 import re
 import time
 import uuid
 
 from aiohttp import WSMsgType, web
 
-from . import camera, config, music, sounds, web_ui
+from . import camera, config, music, screen, sounds, web_ui
 from .brain import Brain, Conversation, is_goodbye, match_claude_trigger, sentences
 from .clock import Alert, Clock
 from .pihelper import PiHelper
@@ -140,6 +141,10 @@ class Session:
         self.ringing: Alert | None = None         # alert currently sounding
         self.alert_waiting: Alert | None = None   # interrupted alert awaiting "stop"/"snooze"
         self.expect = None                        # follow-up handler from the last reply
+        self.screen_ok: bool | None = None        # does the board's firmware have screen modes?
+        self.screen_sig = None                    # timers last shown on the board's countdown
+        self.dice_count = 0
+        self.dice_until = 0.0
 
     # ---------------------------------------------------------------- sending
     async def send_json(self, **msg) -> None:
@@ -188,6 +193,7 @@ class Session:
                 audio_params={"format": "opus", "sample_rate": SPEAKER_RATE,
                               "channels": 1, "frame_duration": FRAME_MS},
             )
+            asyncio.create_task(self.first_screen_sync())
         elif kind == "listen":
             state = msg.get("state")
             if state == "start":
@@ -293,6 +299,24 @@ class Session:
                 if cam:
                     await self.handle_camera(cam, text)
                     return
+
+            if screen.FLIP_RE.match(text):
+                await self.fix_flip()
+                return
+
+            recent = self.dice_count if time.monotonic() < self.dice_until + 30 else None
+            dice = screen.parse_dice(text, recent)
+            if dice:
+                await self.roll_dice(dice)
+                return
+            if time.monotonic() < self.dice_until and screen.DONE_RE.match(text):
+                self.dice_until = 0
+                await self.send_json(type="tts", state="start")
+                await self.screen_cmd("dice_off")
+                await self.speak("Okay.")
+                await self.send_json(type="tts", state="stop")
+                self.start_listening()
+                return
 
             command = music.parse_command(text)
             if command:
@@ -445,7 +469,12 @@ class Session:
                 if alert.kind in ("timer", "alarm", "announce") and time.time() - alert.created > 900:
                     continue  # too late to be useful
                 self.ringing = alert
-                outcome = await self.ring(alert)
+                try:
+                    outcome = await self.ring(alert)
+                except asyncio.CancelledError:
+                    if self.ws.closed and self.ringing is alert:
+                        PENDING.insert(0, alert)  # connection dropped mid-ring: ring it again
+                    raise
                 self.ringing = None
                 if outcome == "timeout" and alert.kind == "alarm":
                     msg = CLOCK.snooze(alert, auto=True)
@@ -457,10 +486,12 @@ class Session:
             if not self.ws.closed:
                 await self.send_json(type="tts", state="stop")
                 self.start_listening()
+                asyncio.create_task(self.after_alerts_screen())
 
     async def ring(self, alert: Alert) -> str:
         """Sound one alert until it times out (cancelled = interrupted by the user)."""
         log.info("[%s] ringing %s", self.device_id, alert.kind)
+        await self.screen_cmd("hide")  # show Visor ringing, not the countdown
         await self.send_json(type="tts", state="start")
         await self.send_json(type="llm", emotion="happy" if alert.kind == "announce" else "alarm")
         if alert.kind in ("announce", "reminder"):
@@ -528,6 +559,75 @@ class Session:
             await self.send_json(type="tts", state="stop")
             await asyncio.sleep(0.3)
             await self.ws.close()
+
+    # ------------------------------------------------- board screen modes
+    async def screen_cmd(self, mode: str, **args) -> bool:
+        """Dice / countdown screens drawn by the board (needs the current firmware)."""
+        if self.screen_ok is False or self.ws.closed:
+            return False
+        result = await self.device_tool("self.jarvis.screen", {"mode": mode, **args})
+        ok = bool(result) and not result.get("isError")
+        if not ok and self.screen_ok is None:
+            log.info("[%s] board has no screen modes (older firmware): reflash for dice and countdowns",
+                     self.device_id)
+        self.screen_ok = ok
+        return ok
+
+    @staticmethod
+    def timer_signature() -> tuple:
+        return tuple(sorted((t["id"], round(t["due"])) for t in STORE.items("timers")))
+
+    async def sync_screen(self, force: bool = False) -> None:
+        """Show the soonest timer as a countdown on the board (or clear it)."""
+        sig = self.timer_signature()
+        if sig == self.screen_sig and not force:
+            return
+        self.screen_sig = sig
+        timers = sorted(STORE.items("timers"), key=lambda t: t["due"])
+        if timers:
+            t = timers[0]
+            caption, icon = screen.timer_caption(t, CLOCK._timer_name(t))
+            await self.screen_cmd("timer", seconds=max(0, round(t["due"] - time.time())),
+                                  total=int(t.get("duration") or 0), label=caption, icon=icon)
+        else:
+            await self.screen_cmd("timer_off")
+
+    async def first_screen_sync(self) -> None:
+        await asyncio.sleep(0.5)  # let the board finish its handshake
+        await self.sync_screen(force=True)
+
+    async def after_alerts_screen(self) -> None:
+        await self.screen_cmd("show")
+        await self.sync_screen(force=True)
+
+    async def fix_flip(self) -> None:
+        """"The screen is upside down": the board turns it round and remembers."""
+        await self.send_json(type="tts", state="start")
+        result = None
+        if self.screen_ok is not False:
+            result = await self.device_tool("self.jarvis.screen", {"mode": "flip_fix"})
+        if result and not result.get("isError"):
+            try:
+                log.info("[%s] screen flipped by request: %s", self.device_id, result["content"][0]["text"])
+            except (KeyError, IndexError, TypeError):
+                pass
+            await self.speak("Done. I've turned the screen round, and I'll remember which way is up.")
+        else:
+            await self.speak("I can't turn the screen with this firmware. Flash the latest version first.")
+        await self.send_json(type="tts", state="stop")
+        self.start_listening()
+
+    async def roll_dice(self, count: int) -> None:
+        a, b = random.randint(1, 6), random.randint(1, 6)
+        self.dice_count, self.dice_until = count, time.monotonic() + 30
+        log.info("[%s] dice: %s", self.device_id, a if count == 1 else (a, b))
+        await self.send_json(type="tts", state="start")
+        if await self.screen_cmd("dice", a=a, b=b, count=count):
+            await asyncio.sleep(0.9)  # let it tumble before saying the number
+        await self.speak(f"You rolled a {a}." if count == 1 else f"{a} and {b}. That's {a + b}.")
+        await self.send_json(type="tts", state="stop")
+        self.conv.last_used = time.monotonic()
+        self.start_listening()
 
     # ----------------------------------------------------------------- camera
     async def handle_camera(self, cmd: camera.Command, heard: str) -> None:
@@ -812,7 +912,11 @@ class Session:
         """Hang up when nobody talks for a while, so the device goes back to idle."""
         while not self.ws.closed:
             await asyncio.sleep(1)
+            if self.alerting:
+                continue  # an alarm or timer is ringing (or about to)
             busy = self.turn_task is not None and not self.turn_task.done()
+            if not self.alerting and self.screen_ok is not False and self.timer_signature() != self.screen_sig:
+                asyncio.create_task(self.sync_screen())
             if self.listening and not busy and not self.detector.started:
                 if time.monotonic() - self.last_activity > config.IDLE_TIMEOUT_S:
                     log.info("[%s] idle, closing session", self.device_id)
