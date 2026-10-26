@@ -170,6 +170,21 @@ Stopping a morning alarm with "stop" plays your morning briefing.
 
 Put your own music files (mp3, flac, m4a, ogg) in the `music` folder; subfolders are fine.
 
+### Changing Wi-Fi
+
+Taking Jarvis somewhere new? Open `http://<your-pi-name>.local:8000/wifi` (e.g. `http://jarvis.local:8000/wifi`) on any
+computer or phone, type the network name and password, and press **Save for Jarvis**. Next time you talk to Jarvis it
+saves the network next to its current one, and connects to whichever is in range. Do this *before* you move: the board
+can only collect it while it can still reach the Pi. The password stays on the Pi only until Jarvis has it.
+
+| You say | What happens |
+|---|---|
+| "Change Wi-Fi" / "Connect to a new network" | Saves anything waiting on the Wi-Fi page; otherwise offers to go into Wi-Fi setup |
+
+Already somewhere without the old network? The board opens its setup hotspot (**Xiaozhi-XXXX**) by itself; join it from a
+phone or laptop and go to `http://192.168.4.1`. Pressing **BOOT** while it starts up does the same. Remember the Pi must be
+on the same network as the board.
+
 ### Pi control (if you said yes to the helper)
 
 | You say | What happens |
@@ -187,7 +202,9 @@ Everything Jarvis can do on the Pi is listed in [`pi-helper/actions.json`](pi-he
 
 | You say | What happens |
 |---|---|
-| "What do you see?" / "Can you see me?" / "What am I holding?" | Takes a photo and Claude describes it |
+| "What do you see?" / "Can you see me?" / "What am I holding?" | Takes a photo, shows it on the screen, and Claude describes it |
+| "Take a picture" | Shows the photo on the board's screen for 20 seconds |
+| "Show me the camera" / "Live view" | A live view on the board's screen (about 5–10 pictures a second). "Look left" works while it's on; double-tap or say "stop" to close it |
 | "Is anyone in the room?" / "Read this" / "How many fingers am I holding up?" | Any question about the picture |
 | "Look left" / "Look up a bit" / "Turn the camera right 45 degrees" | Turns a pan/tilt camera |
 | "Look left and tell me what you see" | Turns, then describes |
@@ -195,7 +212,10 @@ Everything Jarvis can do on the Pi is listed in [`pi-helper/actions.json`](pi-he
 | "Remember this as the door", then later "Look at the door" | Saves where the camera points and goes back to it |
 | "Centre the camera" / "Look straight ahead" | Back to the middle |
 
-Jarvis only takes a photo when you ask, and only sends it to Claude to answer you. The last photo is kept on the Pi (in the assistant's data volume) and replaced by the next one.
+Jarvis only takes a photo when you ask, and only sends it to Claude when you ask it a question about it. Photos and the live view
+go from the Pi to the board over your own Wi-Fi, never to the internet, and each one uses a secret link so other devices on your
+network can't open the camera. The live view switches the camera off by itself a few seconds after the screen closes, and
+after 5 minutes at most. The last photo is kept on the Pi (in the assistant's data volume) and replaced by the next one.
 
 To add a camera later, plug it in and run `bash setup.sh` again, or add these two lines to `.env` and run `docker compose up -d`:
 
@@ -271,6 +291,9 @@ you can set a monthly spending limit in the Claude Console. Without an API key i
   `OTA_URL=http://$(hostname -I | cut -d' ' -f1):8000/xiaozhi/ota/ bash flash-esp32.sh`
   Or, without reflashing: press **BOOT** right after the screen turns on to reopen Wi-Fi setup, and enter that address under **Advanced → Custom OTA URL**.
 * **It hears me but never answers.** Run `docker compose logs -f assistant`: you'll see what it heard and who answered.
+* **The screen keeps flashing black and white after flashing (a restart loop).** A chip on the board can get stuck, and with a
+  battery connected, unplugging USB isn't a full reset. Unplug the **battery** and USB, wait 10 seconds, and plug in USB only.
+  The firmware retries stuck chips at startup and starts without touch rather than looping, but a true power-off clears it.
 * **"No ESP32 found".** Use a data cable. If it still isn't found, unplug the board, hold **BOOT** while plugging it back in, and retry.
 * **"Permission denied" with Docker.** Log out and back in (or reboot) after the first setup, so your user can use Docker.
 * **Alarms don't wake the board.** The board must be on and on Wi-Fi. On battery it powers off after 5 minutes idle, so use USB power if you rely on alarms.

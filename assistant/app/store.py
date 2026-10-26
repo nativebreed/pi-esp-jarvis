@@ -20,6 +20,8 @@ _DEFAULT: dict[str, Any] = {
     "memories": [],    # {id, text, created}
     "lists": {"shopping": [], "to-do": []},  # name -> [{id, text, done}]
     "camera_spots": [],  # {id, name, pan, tilt}  saved camera positions
+    "wifi_pending": [],  # {id, ssid, password, created}  waiting to be sent to the board
+    "wifi_saved": [],    # {id, ssid}  networks the board says it has saved
 }
 
 

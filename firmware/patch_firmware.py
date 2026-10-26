@@ -51,6 +51,25 @@ patch(root / "main/display/lcd_display.cc",
       'settings.GetString("theme", "light")', 'settings.GetString("theme", "dark")')
 print("patched: dark theme by default")
 
+# --- 2b. tougher I2C at startup ---------------------------------------------------
+# If a chip on the shared I2C bus doesn't answer, reset the bus and try again (3 attempts)
+# before the firmware gives up, instead of going straight into a restart loop.
+i2c_src = root / "main/boards/common/i2c_device.cc"
+patch(i2c_src, '#include <esp_log.h>\n', '#include <esp_log.h>\n#include <freertos/FreeRTOS.h>\n#include <freertos/task.h>\n'
+      '\n// Pi-Esp Jarvis: retry I2C transfers, resetting the bus between attempts\n'
+      '#define JV_I2C_RETRY(bus, expr) ({ esp_err_t jv_err = ESP_FAIL; \\\n'
+      '    for (int jv_try = 0; jv_try < 3 && jv_err != ESP_OK; jv_try++) { \\\n'
+      '        if (jv_try > 0) { i2c_master_bus_reset(bus); vTaskDelay(pdMS_TO_TICKS(20)); } \\\n'
+      '        jv_err = (expr); } \\\n'
+      '    jv_err; })\n')
+for old in ["ESP_ERROR_CHECK(i2c_master_transmit(i2c_device_, buffer, 2, 100));",
+            "ESP_ERROR_CHECK(i2c_master_transmit(i2c_device_, tx, length + 1, 100));",
+            "ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, 1, 100));",
+            "ESP_ERROR_CHECK(i2c_master_transmit_receive(i2c_device_, &reg, 1, buffer, length, 100));"]:
+    inner = old[len("ESP_ERROR_CHECK("):-2]
+    patch(i2c_src, old, f"ESP_ERROR_CHECK(JV_I2C_RETRY(i2c_bus_, {inner}));")
+print("patched: I2C retries at startup")
+
 # --- 3. our animated face -------------------------------------------------------
 if emoji_dir and any(emoji_dir.glob("*.gif")):
     cmake = root / "main/CMakeLists.txt"
@@ -114,6 +133,10 @@ AGENT_CODE = r"""
             return;
         }
         self->last_tap_us_ = 0;
+        if (self->cam_mode_ != 0) {  // double-tap closes the camera view
+            self->StopCamera();
+            return;
+        }
         if (self->dice_on_) {  // double-tap leaves dice mode
             self->EndDice();
             return;
@@ -339,6 +362,16 @@ AGENT_CODE = r"""
     int64_t timer_zero_ms_ = 0;
     int64_t keep_awake_ms_ = 0;
 
+    // camera pictures from the Pi (a photo, or a live view made of quick pictures)
+    lv_obj_t* cam_img_ = nullptr;
+    lv_obj_t* cam_badge_ = nullptr;
+    lv_image_dsc_t cam_dsc_[2] = {};
+    uint8_t* cam_buf_[2] = {};
+    int cam_front_ = -1;
+    volatile int cam_mode_ = 0;  // 0 off, 1 photo, 2 live
+    std::atomic<uint32_t> cam_gen_{0};  // changes on every start/stop, so old downloads give up
+    int64_t cam_until_ms_ = 0;
+
     static int64_t NowMs() { return esp_timer_get_time() / 1000; }
 
     static lv_obj_t* Plain(lv_obj_t* parent) {
@@ -435,6 +468,21 @@ AGENT_CODE = r"""
             lv_obj_align(hand, LV_ALIGN_CENTER, h ? 5 : 0, h ? 0 : -6);
         }
         SetTimerColor(kCyan);
+
+        cam_img_ = lv_image_create(mode_root_);
+        lv_obj_remove_flag(cam_img_, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_add_flag(cam_img_, LV_OBJ_FLAG_HIDDEN);
+        cam_badge_ = Plain(mode_root_);  // red "LIVE" tag in the corner
+        lv_obj_set_size(cam_badge_, 64, 24);
+        lv_obj_set_style_radius(cam_badge_, 12, 0);
+        lv_obj_set_style_bg_color(cam_badge_, lv_color_hex(0xE53935), 0);
+        lv_obj_set_style_bg_opa(cam_badge_, LV_OPA_COVER, 0);
+        lv_obj_align(cam_badge_, LV_ALIGN_TOP_LEFT, 14, 8);
+        lv_obj_t* live = lv_label_create(cam_badge_);
+        lv_label_set_text(live, "LIVE");
+        lv_obj_set_style_text_color(live, lv_color_white(), 0);
+        lv_obj_center(live);
+        lv_obj_add_flag(cam_badge_, LV_OBJ_FLAG_HIDDEN);
         lv_timer_create(ModeTick, 70, this);
     }
 
@@ -613,11 +661,29 @@ AGENT_CODE = r"""
     }
 
     void UpdateModes() {  // LVGL lock held
-        bool show = !modes_hidden_ && (dice_on_ || timer_on_);
+        bool cam = cam_mode_ != 0;
+        bool show = !modes_hidden_ && (cam || dice_on_ || timer_on_);
         if (!show) {
             lv_obj_add_flag(mode_root_, LV_OBJ_FLAG_HIDDEN);
             return;
         }
+        if (cam) {  // the camera view sits on top of dice and countdowns
+            for (auto* d : dice_) {
+                lv_obj_add_flag(d, LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_add_flag(timer_box_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_remove_flag(cam_img_, LV_OBJ_FLAG_HIDDEN);
+            if (cam_mode_ == 2) {
+                lv_obj_remove_flag(cam_badge_, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_add_flag(cam_badge_, LV_OBJ_FLAG_HIDDEN);
+            }
+            lv_obj_remove_flag(mode_root_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_move_foreground(mode_root_);
+            return;
+        }
+        lv_obj_add_flag(cam_img_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(cam_badge_, LV_OBJ_FLAG_HIDDEN);
         for (auto* d : dice_) {
             if (!dice_on_) {
                 lv_obj_add_flag(d, LV_OBJ_FLAG_HIDDEN);
@@ -631,6 +697,123 @@ AGENT_CODE = r"""
         }
         lv_obj_remove_flag(mode_root_, LV_OBJ_FLAG_HIDDEN);
         lv_obj_move_foreground(mode_root_);
+    }
+
+    struct CamJob {
+        WaveshareEsp32s3TouchAMOLED1inch8* self;
+        uint32_t gen;
+        std::string url;
+        bool live;
+    };
+
+    void StartCamera(int mode, const std::string& path) {  // LVGL lock held
+        uint32_t gen = ++cam_gen_;
+        cam_mode_ = mode;
+        cam_until_ms_ = NowMs() + (mode == 2 ? 300000 : 20000);  // live: 5 minutes, photo: 20 seconds
+        modes_hidden_ = false;
+        UpdateModes();
+        auto* job = new CamJob{this, gen, ServerBase() + path, mode == 2};
+        if (xTaskCreate(CameraTask, "camview", 8192, job, 3, nullptr) != pdPASS) {
+            delete job;
+            cam_mode_ = 0;
+            UpdateModes();
+        }
+    }
+
+    void StopCamera() {  // LVGL lock held
+        ++cam_gen_;
+        cam_mode_ = 0;
+        lv_image_set_src(cam_img_, nullptr);
+        for (int i = 0; i < 2; i++) {
+            if (cam_buf_[i] != nullptr) {
+                lv_image_cache_drop(&cam_dsc_[i]);
+                heap_caps_free(cam_buf_[i]);
+                cam_buf_[i] = nullptr;
+            }
+        }
+        cam_front_ = -1;
+        UpdateModes();
+    }
+
+    // Decode one JPEG from the Pi and put it on the screen (double-buffered).
+    void ShowJpeg(const std::string& jpeg, uint32_t gen) {
+        uint8_t* out = nullptr;
+        size_t len = 0, w = 0, h = 0, stride = 0;
+        if (jpeg_to_image(reinterpret_cast<const uint8_t*>(jpeg.data()), jpeg.size(), &out, &len, &w, &h,
+                          &stride) != ESP_OK) {
+            return;
+        }
+        if (w == 0 || h == 0 || w > (size_t)kBoxW || h > (size_t)kBoxH || !lvgl_port_lock(0)) {
+            heap_caps_free(out);
+            return;
+        }
+        if (gen != cam_gen_) {  // closed while we were downloading
+            lvgl_port_unlock();
+            heap_caps_free(out);
+            return;
+        }
+        int back = cam_front_ == 0 ? 1 : 0;
+        if (cam_buf_[back] != nullptr) {
+            lv_image_cache_drop(&cam_dsc_[back]);
+            heap_caps_free(cam_buf_[back]);
+        }
+        cam_buf_[back] = out;
+        lv_image_dsc_t& d = cam_dsc_[back];
+        memset(&d, 0, sizeof(d));
+        d.header.magic = LV_IMAGE_HEADER_MAGIC;
+        d.header.cf = LV_COLOR_FORMAT_RGB565;
+        d.header.w = w;
+        d.header.h = h;
+        d.header.stride = stride;
+        d.data_size = len;
+        d.data = out;
+        lv_image_set_src(cam_img_, &d);
+        lv_obj_center(cam_img_);
+        cam_front_ = back;
+        lvgl_port_unlock();
+    }
+
+    static void CameraTask(void* arg) {
+        std::unique_ptr<CamJob> job(static_cast<CamJob*>(arg));
+        auto* self = job->self;
+        int failures = 0;
+        while (job->gen == self->cam_gen_) {
+            int64_t t0 = NowMs();
+            std::string body;
+            {
+                auto http = self->GetNetwork()->CreateHttp(0);
+                http->SetTimeout(5000);
+                if (http->Open("GET", job->url)) {
+                    auto code = http->GetStatusCode();
+                    if (code && *code == 200) {
+                        body = http->ReadAll();
+                    }
+                    http->Close();
+                }
+            }
+            if (job->gen != self->cam_gen_) {
+                break;
+            }
+            if (!body.empty()) {
+                failures = 0;
+                self->ShowJpeg(body, job->gen);
+            } else if (++failures >= 5) {
+                ESP_LOGW(TAG, "Camera view: the Pi stopped sending pictures");
+                if (lvgl_port_lock(0)) {
+                    if (job->gen == self->cam_gen_) {
+                        self->StopCamera();
+                    }
+                    lvgl_port_unlock();
+                }
+                break;
+            }
+            if (!job->live) {
+                break;  // a photo: one picture is enough
+            }
+            int64_t spent = NowMs() - t0;
+            vTaskDelay(pdMS_TO_TICKS(spent < 90 ? 90 - spent : 5));  // at most about 10 pictures a second
+        }
+        vTaskDelete(nullptr);
     }
 
     static void ModeTick(lv_timer_t* t) {
@@ -688,7 +871,10 @@ AGENT_CODE = r"""
                 }
             }
         }
-        if ((dice_on_ || timer_on_) && !modes_hidden_ && now - keep_awake_ms_ > 5000) {
+        if (cam_mode_ != 0 && now > cam_until_ms_) {
+            StopCamera();  // photo shown long enough / live view ran for 5 minutes
+        }
+        if ((cam_mode_ != 0 || dice_on_ || timer_on_) && !modes_hidden_ && now - keep_awake_ms_ > 5000) {
             keep_awake_ms_ = now;
             power_save_timer_->WakeUp();  // keep the screen on while there's something to see
         }
@@ -719,7 +905,7 @@ AGENT_CODE = r"""
     }
 
     ReturnValue ScreenCommand(const std::string& mode, int a, int b, int count, int seconds, int total,
-                              const std::string& label, const std::string& icon) {
+                              const std::string& label, const std::string& icon, const std::string& path) {
         if (mode == "flip_fix") {
             return FixFlip();
         }
@@ -744,7 +930,20 @@ AGENT_CODE = r"""
             modes_hidden_ = true;
         } else if (mode == "show") {
             modes_hidden_ = false;
+        } else if (mode == "photo" || mode == "live") {
+            if (path.empty() || path.size() > 200) {
+                lvgl_port_unlock();
+                return false;
+            }
+            StartCamera(mode == "live" ? 2 : 1, path);
+        } else if (mode == "camera_off") {
+            if (cam_mode_ != 0) {
+                StopCamera();
+            }
         } else if (mode == "off") {
+            if (cam_mode_ != 0) {
+                StopCamera();
+            }
             dice_on_ = false;
             timer_on_ = false;
             modes_hidden_ = false;
@@ -762,7 +961,7 @@ AGENT_CODE = r"""
         McpServer::GetInstance().AddTool(
             "self.jarvis.screen",
             "Pi-Esp Jarvis screen modes, used by the Pi server: mode = dice | dice_off | timer | timer_off | "
-            "hide | show | off | flip_fix | orientation.",
+            "hide | show | off | flip_fix | orientation | photo | live | camera_off.",
             PropertyList({Property("mode", kPropertyTypeString),
                           Property("a", kPropertyTypeInteger, 1),
                           Property("b", kPropertyTypeInteger, 1),
@@ -770,11 +969,41 @@ AGENT_CODE = r"""
                           Property("seconds", kPropertyTypeInteger, 0),
                           Property("total", kPropertyTypeInteger, 0),
                           Property("label", kPropertyTypeString, std::string("")),
-                          Property("icon", kPropertyTypeString, std::string("timer"))}),
+                          Property("icon", kPropertyTypeString, std::string("timer")),
+                          Property("path", kPropertyTypeString, std::string(""))}),
             [this](const PropertyList& p) -> ReturnValue {
                 return ScreenCommand(p["mode"].value<std::string>(), p["a"].value<int>(), p["b"].value<int>(),
                                      p["count"].value<int>(), p["seconds"].value<int>(), p["total"].value<int>(),
-                                     p["label"].value<std::string>(), p["icon"].value<std::string>());
+                                     p["label"].value<std::string>(), p["icon"].value<std::string>(),
+                                     p["path"].value<std::string>());
+            });
+    }
+
+    // ------------------------------------------------- Wi-Fi from the Pi
+    // The Pi's Wi-Fi page sends networks here; they join the board's saved list (newest first).
+    void InitializeWifiTool() {
+        McpServer::GetInstance().AddTool(
+            "self.jarvis.add_wifi",
+            "Pi-Esp Jarvis: save another Wi-Fi network (used by the Pi's Wi-Fi page).",
+            PropertyList({Property("ssid", kPropertyTypeString),
+                          Property("password", kPropertyTypeString, std::string(""))}),
+            [](const PropertyList& p) -> ReturnValue {
+                std::string ssid = p["ssid"].value<std::string>();
+                std::string password = p["password"].value<std::string>();
+                if (ssid.empty() || ssid.size() > 32 || password.size() > 64) {
+                    return false;
+                }
+                auto& ssids = SsidManager::GetInstance();
+                ssids.AddSsid(ssid, password);
+                ESP_LOGI(TAG, "Saved Wi-Fi network from the Pi: %s", ssid.c_str());
+                std::string names;
+                for (const auto& item : ssids.GetSsidList()) {
+                    if (!names.empty()) {
+                        names += "\n";
+                    }
+                    names += item.ssid;
+                }
+                return names;
             });
     }
 
@@ -873,6 +1102,7 @@ AGENT_CODE = r"""
         up_axis_ = settings.GetInt("up_axis", JV_UP_AXIS);  // board default; "flip the screen" overrides it
         up_sign_ = settings.GetInt("up_sign", JV_UP_SIGN) < 0 ? -1 : 1;
         InitializeScreenModes();
+        InitializeWifiTool();
         xTaskCreate(WakeChannelTask, "wake_channel", 6144, this, 2, nullptr);
         if (InitializeImu()) {
             xTaskCreate(GestureTask, "gestures", 4096, this, 2, nullptr);
@@ -897,13 +1127,30 @@ if "InitializeAgentExtras" not in text:
                       r"\n\1esp_lcd_panel_disp_on_off(panel, true);\n\1jv_panel_ = panel;\n", text, count=1)
     if n != 1:
         sys.exit(f"patch_firmware: display setup not found in {src}")
-    text, n = re.subn(r"(\n(\s*)ESP_ERROR_CHECK\(esp_lcd_touch_new_i2c_\w+\(tp_io_handle, &tp_cfg, &tp\)\);\n)",
-                      r"\1\2jv_touch_ = tp;\n", text, count=1)
+    def _touch_retry(m: re.Match) -> str:
+        i, fn = m.group(1), m.group(2)
+        lines = ["esp_err_t touch_err = ESP_FAIL;",
+                 "for (int attempt = 0; attempt < 3 && touch_err != ESP_OK; attempt++) {",
+                 "    if (attempt > 0) {  // a chip that didn't answer: free the bus and try again",
+                 "        i2c_master_bus_reset(codec_i2c_bus_);",
+                 "        vTaskDelay(pdMS_TO_TICKS(200));",
+                 "    }",
+                 f"    touch_err = {fn}(tp_io_handle, &tp_cfg, &tp);",
+                 "}",
+                 "if (touch_err != ESP_OK) {",
+                 '    ESP_LOGE(TAG, "Touch screen not responding: carrying on without touch");',
+                 "    return;",
+                 "}",
+                 "jv_touch_ = tp;"]
+        return "\n" + "".join(i + line + "\n" for line in lines)
+    text, n = re.subn(r"\n(\s*)ESP_ERROR_CHECK\((esp_lcd_touch_new_i2c_\w+)\(tp_io_handle, &tp_cfg, &tp\)\);\n",
+                      _touch_retry, text, count=1)
     if n != 1:
         sys.exit(f"patch_firmware: touch setup not found in {src}")
     extra_inc = ("#include <esp_timer.h>\n#include <esp_random.h>\n#include <algorithm>\n#include <cmath>\n"
                  "#include <cstdio>\n#include <memory>\n#include <string>\n#include \"system_info.h\"\n"
-                 "#include \"mcp_server.h\"\n"
+                 "#include \"mcp_server.h\"\n#include <ssid_manager.h>\n#include <cstring>\n"
+                 "#include <esp_heap_caps.h>\n#include \"jpeg_to_image.h\"\n#include <src/misc/cache/lv_cache.h>\n#include <atomic>\n"
                  f"#define JV_FLIP_OFFSET_X {flip_x}\n#define JV_FLIP_OFFSET_Y {flip_y}\n"
                  f"#define JV_UP_AXIS {up_axis}\n#define JV_UP_SIGN {up_sign}")
     text = text.replace("#include <lvgl.h>", "#include <lvgl.h>\n" + extra_inc, 1)

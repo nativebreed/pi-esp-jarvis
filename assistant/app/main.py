@@ -14,6 +14,7 @@ import json
 import logging
 import random
 import re
+import secrets
 import time
 import uuid
 
@@ -76,6 +77,13 @@ SKILLS = Skills(STORE, CLOCK, WEATHER, HELPER)
 CAMERA = camera.Camera(STORE)
 
 SNOOZE_RE = re.compile(r"\bsnooze\b|\b(?:\d+|five|ten|fifteen|twenty)\s+more\s+minutes\b|\blater\b|\bnot yet\b", re.I)
+_WIFI = r"(?:wi-?\s?fi|wireless)"
+WIFI_RE = re.compile(
+    r"^\W*(?:(?:hey|ok|okay|so|please|jarvis|can you|could you|i want to|i need to|let'?s)[\s,]+)*"
+    rf"(?:(?:change|switch|reset|set\s?up|configure|update|redo)\s+(?:the\s+|my\s+|your\s+)?{_WIFI}"
+    r"(?:\s+(?:network|settings|details|password|connection))?|"
+    rf"(?:connect|join)\s+(?:you\s+)?(?:to\s+)?(?:a\s+|the\s+)?(?:new|different|another|other)\s+(?:{_WIFI}|network)(?:\s+network)?|"
+    rf"(?:new\s+{_WIFI}|{_WIFI}\s+set\s?up))\W*$", re.I)
 DISMISS_RE = re.compile(r"^\W*(?:(?:ok(?:ay)?|jarvis)[\s,]+)?(?:stop|ok(?:ay)?|thanks?|thank you|dismiss|cancel|turn (?:it )?off|"
                         r"shut up|enough|i'?m (?:up|awake)|got it|done|alright|all right|fine|silence|quiet)\b", re.I)
 
@@ -145,6 +153,8 @@ class Session:
         self.screen_sig = None                    # timers last shown on the board's countdown
         self.dice_count = 0
         self.dice_until = 0.0
+        self.cam_screen: str | None = None        # "photo" / "live" while the camera is on the board's screen
+        self.cam_screen_until = 0.0
 
     # ---------------------------------------------------------------- sending
     async def send_json(self, **msg) -> None:
@@ -299,6 +309,14 @@ class Session:
                 if cam:
                     await self.handle_camera(cam, text)
                     return
+
+            if self.camera_showing() and camera.CAM_OFF_RE.match(text):
+                await self.camera_off()
+                return
+
+            if WIFI_RE.match(text):
+                await self.deliver(await self.change_wifi(), text)
+                return
 
             if screen.FLIP_RE.match(text):
                 await self.fix_flip()
@@ -595,6 +613,50 @@ class Session:
     async def first_screen_sync(self) -> None:
         await asyncio.sleep(0.5)  # let the board finish its handshake
         await self.sync_screen(force=True)
+        await self.deliver_wifi()
+
+    async def deliver_wifi(self) -> list[str]:
+        """Send networks typed on the Pi's Wi-Fi page to the board. Returns the ones it saved."""
+        sent = []
+        for w in STORE.items("wifi_pending"):
+            if self.ws.closed:
+                break
+            result = await self.device_tool("self.jarvis.add_wifi", {"ssid": w["ssid"], "password": w["password"]})
+            if not result or result.get("isError"):
+                log.info("[%s] board can't take Wi-Fi from the Pi yet (older firmware): reflash", self.device_id)
+                break
+            STORE.remove("wifi_pending", {w["id"]})
+            sent.append(w["ssid"])
+            try:
+                names = [n for n in result["content"][0]["text"].split("\n") if n]
+            except (KeyError, IndexError, TypeError):
+                names = [w["ssid"]]
+            STORE.remove("wifi_saved", {x["id"] for x in STORE.items("wifi_saved")})
+            for n in names:
+                STORE.add("wifi_saved", {"ssid": n})
+            log.info("[%s] Wi-Fi network %r saved on the board", self.device_id, w["ssid"])
+        return sent
+
+    async def change_wifi(self) -> Reply:
+        """"Jarvis, change Wi-Fi"."""
+        if STORE.items("wifi_pending"):
+            sent = await self.deliver_wifi()
+            if sent:
+                names = " and ".join(sent)
+                return Reply(f"I've saved {names} from the Wi-Fi page. I'll use it whenever I can't find my current network.")
+
+        async def confirm(text: str) -> Reply | None:
+            if not _YES.match(text):
+                return Reply("OK, I'll stay connected. You can also add a network on the Wi-Fi page on the Pi.")
+
+            async def enter_setup() -> None:
+                await self.device_tool("self.system.reconfigure_wifi")
+            return Reply("OK. On your phone or laptop, join the Wi-Fi network called Xiaozhi, then open "
+                         "one nine two, dot one six eight, dot four, dot one, and pick your network. See you soon.",
+                         after=enter_setup)
+        return Reply("I can go into Wi-Fi setup now, but I'll be offline until you choose a network. Or add it on "
+                     "the Wi-Fi page on the Pi, next to your lists, and I'll stay connected. Shall I go into setup?",
+                     emotion="confused", expect=confirm)
 
     async def after_alerts_screen(self) -> None:
         await self.screen_cmd("show")
@@ -639,6 +701,10 @@ class Session:
         self.start_listening()
 
     async def camera_turn(self, cmd: camera.Command, heard: str) -> None:
+        if cmd.kind == "live":
+            return await self.camera_live()
+        if cmd.kind == "photo":
+            return await self.camera_photo()
         if cmd.kind in ("move", "centre", "goto", "around", "save") and not await CAMERA.can_move():
             if cmd.kind in ("around", "goto") or cmd.question:
                 return await self.camera_look(cmd.question or heard)
@@ -702,8 +768,66 @@ class Session:
         if not image:
             await self.speak("Sorry, I couldn't get a picture from the camera.")
             return
+        if self.cam_screen != "live" or not CAMERA.live.running:
+            asyncio.create_task(self.show_photo(image))  # let them see what Jarvis is looking at
         await self.answer(question, use_claude=True, extra=camera.vision_prompt(1),
                           filler="", images=[("", image)])
+
+    # ------------------------------------------------- camera on the board's screen
+    def camera_showing(self) -> bool:
+        if self.cam_screen == "live":
+            return CAMERA.live.running
+        return self.cam_screen == "photo" and time.monotonic() < self.cam_screen_until
+
+    @staticmethod
+    def new_view_key() -> str:
+        CAMERA.view_key = secrets.token_urlsafe(9)
+        return CAMERA.view_key
+
+    async def show_photo(self, image: bytes) -> bool:
+        small = await CAMERA.for_screen(image)
+        if not small:
+            return False
+        CAMERA.screen_photo = small
+        key = CAMERA.view_key or self.new_view_key()
+        ok = await self.screen_cmd("photo", path=f"camera/photo.jpg?k={key}&n={int(time.time() * 1000)}")
+        if ok:
+            self.cam_screen, self.cam_screen_until = "photo", time.monotonic() + 20
+        return ok
+
+    async def camera_photo(self) -> None:
+        await self.send_json(type="llm", emotion="happy")
+        snap = asyncio.create_task(CAMERA.snapshot())
+        await self.speak("Say cheese!")
+        image = await snap
+        if not image:
+            await self.speak("Sorry, I couldn't get a picture from the camera.")
+        elif await self.show_photo(image):
+            await self.speak("Here it is.")
+        else:
+            await self.speak("I took the picture, but showing it on my screen needs the latest firmware.")
+
+    async def camera_live(self) -> None:
+        await self.send_json(type="llm", emotion="thinking", text="🤔")
+        key = self.new_view_key()
+        if not await CAMERA.live.frame():
+            await self.speak("Sorry, I couldn't start the camera.")
+            return
+        if await self.screen_cmd("live", path=f"camera/live.jpg?k={key}"):
+            self.cam_screen = "live"
+            await self.speak("Here's the live view. Double-tap or say stop when you're done.")
+        else:
+            await CAMERA.live.stop()
+            await self.speak("Showing the camera on my screen needs the latest firmware. Flash it first.")
+
+    async def camera_off(self) -> None:
+        await self.send_json(type="tts", state="start")
+        await self.screen_cmd("camera_off")
+        await CAMERA.live.stop()
+        CAMERA.view_key, self.cam_screen = None, None
+        await self.speak("Okay.")
+        await self.send_json(type="tts", state="stop")
+        self.start_listening()
 
     async def camera_look_around(self, question: str) -> None:
         if not BRAIN.claude_available:
@@ -1024,6 +1148,35 @@ async def on_startup(app: web.Application) -> None:
         log.info("Camera: not connected (see docker-compose.camera.yml)")
 
 
+def _view_key_ok(request: web.Request) -> bool:
+    key = request.query.get("k", "")
+    return bool(CAMERA.view_key) and secrets.compare_digest(key, CAMERA.view_key)
+
+
+async def camera_photo_http(request: web.Request) -> web.Response:
+    """The last photo, sized for the board's screen (the board fetches it)."""
+    if not _view_key_ok(request) or not CAMERA.screen_photo:
+        raise web.HTTPForbidden()
+    return web.Response(body=CAMERA.screen_photo, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+async def camera_live_http(request: web.Request) -> web.Response:
+    """The newest live-view picture (the board asks for one after another)."""
+    if not CAMERA.present or not _view_key_ok(request):
+        raise web.HTTPForbidden()
+    frame = await CAMERA.live.frame()
+    if not frame:
+        raise web.HTTPServiceUnavailable()
+    return web.Response(body=frame, content_type="image/jpeg", headers={"Cache-Control": "no-store"})
+
+
+def wifi_added() -> None:
+    """A network was typed on the Wi-Fi page: hand it over now if Jarvis is connected."""
+    for session in list(SESSIONS.values()):
+        if not session.ws.closed:
+            asyncio.create_task(session.deliver_wifi())
+
+
 def make_app() -> web.Application:
     app = web.Application()
     app.router.add_route("*", "/xiaozhi/ota/", ota)
@@ -1033,7 +1186,9 @@ def make_app() -> web.Application:
     app.router.add_get("/health", health)
     app.router.add_get("/xiaozhi/events", events)
     app.router.add_post("/xiaozhi/gesture", gesture)
-    web_ui.add_routes(app, STORE)
+    app.router.add_get("/xiaozhi/camera/photo.jpg", camera_photo_http)
+    app.router.add_get("/xiaozhi/camera/live.jpg", camera_live_http)
+    web_ui.add_routes(app, STORE, on_wifi=wifi_added)
     app.on_startup.append(on_startup)
     return app
 

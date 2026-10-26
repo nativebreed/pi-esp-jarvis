@@ -6,6 +6,8 @@ Voice commands (after "Jarvis"):
   "look around"                                                      -> 3 photos, left to right
   "remember this as the door"  then later  "look at the door"        -> saved positions
   "centre the camera" / "look straight ahead"                        -> back to the middle
+  "show me the camera"                                               -> live view on the board's screen
+  "take a picture"                                                   -> the photo on the board's screen
 
 Pan/tilt works on UVC cameras that expose pan_relative / tilt_relative
 (e.g. Logitech QuickCam Orbit / Sphere). Other webcams still do photos.
@@ -62,7 +64,16 @@ VISION_RE = re.compile(
     r"\bis (?:there )?any(?:one|body) (?:there|here|in the room)\b|\bwho'?s there\b|\bwho is there\b|"
     r"\bhow do i look\b|\bhow does (?:this|it|the room) look\b|"
     r"\b(?:through|with|using|on|from) (?:the|your) camera\b|\buse (?:the|your) camera\b|\bcheck the camera\b|"
-    r"\btake a (?:photo|picture|snapshot|pic)\b", re.I)
+    r"\b(?:take|snap)\s+a\s+(?:photo|picture|snapshot|pic)\s+(?:and|then)\b", re.I)
+LIVE_RE = re.compile(_LEAD + r"(?:show\s+(?:me\s+)?(?:the\s+|your\s+)?(?:camera|live\s+(?:view|camera|feed|video)|camera\s+(?:view|feed))|"
+                     r"show\s+me\s+what\s+(?:you\s+can\s+see|you\s+see|the\s+camera\s+(?:sees|can\s+see))|"
+                     r"(?:turn\s+on|switch\s+on|start|open)\s+(?:the\s+)?(?:camera|live\s+view|camera\s+view)|"
+                     r"(?:live\s+(?:view|camera|feed)|camera\s+on))(?:\s+(?:on\s+(?:the\s+|your\s+)?screen|please))?\W*$", re.I)
+PHOTO_RE = re.compile(_LEAD + r"(?:(?:take|snap|grab)\s+(?:me\s+)?a\s+(?:photo|picture|snapshot|pic)|"
+                      r"show\s+me\s+a\s+(?:photo|picture|snapshot)(?:\s+from\s+the\s+camera)?)\W*$", re.I)
+CAM_OFF_RE = re.compile(_LEAD + r"(?:stop|done|enough|that'?s enough|thanks?|thank you|ok(?:ay)?|close(?:\s+it)?|"
+                        r"(?:close|hide|stop|turn\s+off|switch\s+off)\s+(?:the\s+)?(?:camera|picture|photo|live\s+view|video)|"
+                        r"camera\s+off|back\s+to\s+(?:normal|visor))\W*$", re.I)
 
 # "look at me / this / it" are about the picture, not a saved position
 _NOT_PLACES = {"me", "this", "that", "it", "these", "those", "us", "him", "her", "them", "here", "my face",
@@ -98,6 +109,10 @@ def _name(raw: str) -> str:
 
 def parse_command(text: str) -> Command | None:
     t = text.strip()
+    if LIVE_RE.match(t):
+        return Command("live")
+    if PHOTO_RE.match(t):
+        return Command("photo")
     m = MOVE_RE.match(t)
     if m:
         d = m.group("dir").lower()
@@ -129,6 +144,112 @@ def parse_command(text: str) -> Command | None:
     return None
 
 
+SCREEN_W, SCREEN_H = 368, 272   # pictures for the board's screen; both multiples of 16 for its JPEG decoder
+# Fill the frame, crop the edges, and write the plainest kind of JPEG (4:2:0 colour, standard tables),
+# which is what the board's small decoder understands.
+SCREEN_FILTER = (f"scale={SCREEN_W}:{SCREEN_H}:force_original_aspect_ratio=increase,"
+                 f"crop={SCREEN_W}:{SCREEN_H},format=yuvj420p")
+SCREEN_JPEG = ["-pix_fmt", "yuvj420p", "-huffman", "default"]
+
+
+class LiveFeed:
+    """Keeps the webcam running and the newest small JPEG ready while the board shows the live view."""
+
+    def __init__(self, cam: "Camera") -> None:
+        self.cam = cam
+        self.proc: asyncio.subprocess.Process | None = None
+        self.reader: asyncio.Task | None = None
+        self.latest: bytes | None = None
+        self.latest_t = 0.0
+        self.started_t = 0.0
+        self.last_request = 0.0
+        self.fresh = asyncio.Event()
+        self.idle_task: asyncio.Task | None = None
+
+    @property
+    def running(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    async def start(self) -> None:
+        async with self.cam.lock:  # wait for any photo or camera move in progress
+            if self.running:
+                return
+            # Ask the webcam for compressed pictures (MJPG): raw video is far too much for USB at this size.
+            for opts in (["-input_format", "mjpeg", "-video_size", "640x480", "-framerate", "15"],
+                         ["-input_format", "mjpeg"], ["-video_size", "640x480"], []):
+                self.proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2", *opts, "-i", self.cam.device,
+                    "-vf", SCREEN_FILTER, *SCREEN_JPEG, "-q:v", "6", "-f", "mjpeg", "pipe:1",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                self.latest, self.started_t = None, time.monotonic()
+                self.fresh.clear()
+                self.reader = asyncio.create_task(self._read(self.proc))
+                try:
+                    await asyncio.wait_for(self.fresh.wait(), 6)
+                    log.info("live view: camera settings %s", " ".join(opts) or "default")
+                    break
+                except asyncio.TimeoutError:
+                    err = b""
+                    if self.proc and self.proc.returncode is not None and self.proc.stderr:
+                        err = await self.proc.stderr.read()
+                    log.warning("live view: no pictures with %s %s", " ".join(opts) or "default settings",
+                                err.decode(errors="replace").strip()[-200:])
+                    await self._kill()
+            if self.running:
+                log.info("live view started")
+                if self.idle_task is None or self.idle_task.done():
+                    self.idle_task = asyncio.create_task(self._stop_when_idle())
+
+    async def _read(self, proc: asyncio.subprocess.Process) -> None:
+        buf = b""
+        while True:
+            chunk = await proc.stdout.read(65536)
+            if not chunk:
+                break
+            buf += chunk
+            while True:  # the stream is one JPEG after another
+                start = buf.find(b"\xff\xd8")
+                if start < 0:
+                    buf = b""
+                    break
+                end = buf.find(b"\xff\xd9", start + 2)
+                if end < 0:
+                    buf = buf[start:]
+                    break
+                self.latest, self.latest_t = buf[start:end + 2], time.monotonic()
+                self.fresh.set()
+                buf = buf[end + 2:]
+            if len(buf) > 4_000_000:
+                buf = b""
+
+    async def frame(self) -> bytes | None:
+        """The newest picture, starting the camera if needed."""
+        self.last_request = time.monotonic()
+        if not self.running:
+            await self.start()
+        return self.latest if self.running else None
+
+    async def _stop_when_idle(self) -> None:
+        while self.running:
+            await asyncio.sleep(2)
+            if time.monotonic() - self.last_request > 8:  # the board stopped asking
+                await self.stop()
+                self.cam.view_key = None
+                log.info("live view stopped (screen closed)")
+
+    async def _kill(self) -> None:
+        proc, self.proc = self.proc, None
+        if proc and proc.returncode is None:
+            proc.kill()
+            await proc.wait()
+        if self.reader:
+            self.reader.cancel()
+
+    async def stop(self) -> None:
+        await self._kill()
+        self.latest = None
+
+
 class Camera:
     def __init__(self, store: Store) -> None:
         self.store = store
@@ -139,6 +260,9 @@ class Camera:
         self.pan_limit = 70.0        # replaced by the camera's own range when we can read it
         self.tilt_limit = 30.0
         self._can_move: bool | None = None
+        self.live = LiveFeed(self)
+        self.screen_photo: bytes | None = None   # last photo, sized for the board's screen
+        self.view_key: str | None = None         # secret in the board's picture links
 
     # ------------------------------------------------------------------ state
     @property
@@ -175,6 +299,8 @@ class Camera:
     async def snapshot(self) -> bytes | None:
         """One JPEG from the camera, after letting the exposure settle."""
         async with self.lock:
+            if self.live.running:  # the live view has the camera: borrow it for a full-size photo
+                await self.live.stop()
             base = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "v4l2"]
             tail = ["-i", self.device, "-ss", str(config.CAMERA_WARMUP_S), "-frames:v", "1",
                     "-q:v", "3", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1"]
@@ -192,6 +318,15 @@ class Camera:
                     return out
                 log.warning("snapshot failed (%s): %s", rc, err[-300:])
             return None
+
+    async def for_screen(self, jpeg: bytes) -> bytes | None:
+        """Shrink a photo to fit the board's screen."""
+        proc = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+            "-vf", SCREEN_FILTER, *SCREEN_JPEG, "-q:v", "4", "-f", "image2pipe", "-vcodec", "mjpeg", "pipe:1",
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await proc.communicate(jpeg)
+        return out if proc.returncode == 0 and out[:2] == b"\xff\xd8" else None
 
     # ------------------------------------------------------------ pan / tilt
     async def move(self, pan: float = 0.0, tilt: float = 0.0) -> tuple[float, float]:
