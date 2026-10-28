@@ -32,6 +32,8 @@ def chime(kind: str) -> np.ndarray:
     if kind == "alarm":   # bright rising arpeggio, repeated
         return _seq([(659, 0.0, 0.5), (784, 0.15, 0.5), (988, 0.30, 0.6), (1319, 0.45, 0.9),
                      (659, 1.0, 0.5), (784, 1.15, 0.5), (988, 1.30, 0.6), (1319, 1.45, 0.9)])
+    if kind == "rec":     # one short ping: recording starts now
+        return _seq([(1319, 0.0, 0.25)], tail=0.05)
     if kind == "timer":   # three quick pings
         return _seq([(1047, 0.0, 0.4), (1047, 0.3, 0.4), (1319, 0.6, 0.8)])
     # reminder / announce: gentle two-note

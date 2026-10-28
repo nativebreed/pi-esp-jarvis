@@ -22,12 +22,14 @@ services:
     env_file: .env
     environment:
       - OLLAMA_URL=http://ollama:11434
+      - NOTES_DIR=/notes
     extra_hosts:
       - "host.docker.internal:host-gateway"   # lets the container reach the Pi helper
     volumes:
       - assistant-data:/data         # Whisper + Piper models, downloaded on first start
       - /etc/localtime:/etc/localtime:ro   # use the Pi's time zone
       - ${MUSIC_FOLDER:-./music}:/music:ro    # your music files (optional)
+      - ${NOTES_FOLDER:-./voice-notes}:/notes   # voice notes: YYYYMMDDHHMMSS.ogg + .txt transcripts
     ports:
       - "8000:8000"                  # the ESP32 connects here
 

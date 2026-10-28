@@ -77,4 +77,11 @@ CAMERA_RESOLUTION = _env("CAMERA_RESOLUTION", "960x720")   # "" = camera default
 CAMERA_WARMUP_S = _env_float("CAMERA_WARMUP_S", 1.5)      # let the exposure settle
 CAMERA_PAN_INVERT = _env("CAMERA_PAN_INVERT", "false").lower() in ("1", "true", "yes", "on")
 
+# --- Voice notes ---------------------------------------------------------------------------
+NOTES_DIR = Path(_env("NOTES_DIR", str(DATA_DIR / "voice-notes")))  # docker-compose maps ./voice-notes here
+NOTES_CLAUDE = _env("NOTES_CLAUDE", "false").lower() in ("1", "true", "yes", "on")  # Claude tidies + titles
+NOTES_SILENCE_STOP_S = _env_float("NOTES_SILENCE_STOP_S", 120)  # stop recording after this much quiet
+NOTES_MAX_MINUTES = _env_float("NOTES_MAX_MINUTES", 30)         # longest single note
+NOTES_IDLE_CLOSE_S = _env_float("NOTES_IDLE_CLOSE_S", 600)      # close the recorder when left alone
+
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")

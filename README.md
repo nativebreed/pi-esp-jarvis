@@ -233,6 +233,32 @@ CAMERA_DEVICE=/dev/video0
 | *Shake the board* (while the dice are showing) | Rolls again, and the caption shows the result |
 | "Done" / *double-tap* | Back to Visor (it also goes back by itself after 30 seconds) |
 
+### Voice notes
+
+Say **"Jarvis, go into voice notes"** and the screen turns into a recorder: **record · pause · stop · play** along the bottom,
+a level meter, the time, and the note's date. Swipe (or tap ‹ ›) for older and newer notes; tap ✕ to close.
+
+| You say | What happens |
+|---|---|
+| "Go into voice notes" / "Voice notes" | Opens the recorder with your newest note |
+| "Take a note" | Opens the recorder and starts recording straight away |
+| *Tap record, then stop* | Records a note; pause leaves a gap you can carry on after |
+| "Play my last note" / "Play my first note" | Plays it through the board |
+| "Read my last note" | Reads out the transcript |
+| "Delete that note" | Asks first, then deletes the one on screen (or the one you just heard) |
+| "Next" / "Previous" / "Play" / "Pause" / "Stop" | The same as the buttons, while the recorder is open (not while recording: then the mic is busy with your note) |
+| "Close voice notes" / ✕ | Back to Visor (saves a recording in progress) |
+
+Recording stops by itself after 2 minutes of quiet or 30 minutes in all. Each note is saved on the Pi in the **`voice-notes`**
+folder, named by when you recorded it: `20261028143205.ogg`, with `20261028143205.txt` beside it, written by Whisper on the Pi a
+few seconds after you stop. With `NOTES_CLAUDE=true`, Claude also tidies the transcript (punctuation, paragraphs, no "um"s)
+and gives each note a title; only the text is sent, never the audio.
+
+Open **`http://raspi5.local:8000/notes`** (the **Voice notes** tab next to Lists and Wi-Fi) to play notes in the browser, read and
+search the transcripts, download the audio or text, run a transcript again, or delete notes.
+
+The recorder screen needs the current firmware. On older firmware "take a note" still works by voice: talk, then stay quiet for a few seconds.
+
 ### Gestures
 
 | Gesture | While ringing | While talking or playing | While idle |
@@ -271,6 +297,10 @@ Everything lives in the `.env` file. After editing it, run `docker compose up -d
 | `IDLE_TIMEOUT_S` | `10` | Seconds of silence before the board goes back to sleep |
 | `CAMERA_DEVICE` | – | Your webcam, e.g. `/dev/video0` (needs the `COMPOSE_FILE` line above) |
 | `CAMERA_PAN_INVERT` | `false` | Set to `true` if "look left" turns the camera right |
+| `NOTES_FOLDER` | `./voice-notes` | Where voice notes are kept on the Pi |
+| `NOTES_CLAUDE` | `false` | `true` = Claude tidies each transcript and gives it a title |
+| `NOTES_SILENCE_STOP_S` | `120` | Stop recording after this many seconds of quiet |
+| `NOTES_MAX_MINUTES` | `30` | Longest single note |
 
 **Firmware options** (put them before `bash flash-esp32.sh`):
 `WAKE_WORD=hiesp` (say "Hi ESP" instead of "Jarvis"), `OTA_URL=http://192.168.1.50:8000/xiaozhi/ota/` (use the Pi's IP address), `REBUILD=1` (force a fresh build),
@@ -301,6 +331,9 @@ you can set a monthly spending limit in the Claude Console. Without an API key i
 * **Visor is upside down when the board stands normally.** Say "Jarvis, flip the screen" with the board the right way up.
 * **After the screen flips, the picture sits a little off-centre.** Some screens need a different offset when turned round.
   Reflash with e.g. `FLIP_OFFSET=16,0 bash flash-esp32.sh v2` (try `0,0`, `16,0` or `26,0` until it's centred).
+* **"Go into voice notes" says the recorder screen needs the latest firmware.** Reflash the board (`bash flash-esp32.sh v2`).
+* **I can't delete notes in the `voice-notes` folder.** Docker writes them as root: delete them on the Voice notes page, or use `sudo rm`.
+* **A note plays in Chrome but not on my iPhone.** The page falls back to WAV automatically; if an old browser still won't play it, use Download audio.
 * **The wake word rarely triggers.** Speak from about 1 m away, or rebuild with `WAKE_WORD=hiesp REBUILD=1 bash flash-esp32.sh`.
 
 ## What's in the box
@@ -311,10 +344,11 @@ flash-esp32.sh         builds and flashes the board firmware (in Docker)
 docker-compose.yml     the two containers: ollama (local AI) and assistant
 docker-compose.camera.yml  optional: gives the assistant your USB webcam
 .env.example           all settings (setup.sh copies this to .env)
-assistant/             the Pi server (Python): speech, router, skills, Claude, music, lists page
+assistant/             the Pi server (Python): speech, router, skills, Claude, music, voice notes, web pages
 pi-helper/             optional helper that lets Jarvis control the Pi (install.sh, actions.json)
 firmware/              firmware builder: xiaozhi-esp32 (pinned) + our patches + the Visor face
 music/                 put your own music here (optional)
+voice-notes/           your voice notes and transcripts (made on first use)
 docs/                  pictures for this README
 ```
 

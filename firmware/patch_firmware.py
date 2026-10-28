@@ -106,7 +106,7 @@ AGENT_CODE = r"""
     //   * wake channel: an idle board waits on the Pi so alarms/timers can wake it
     //   * motion gestures (QMI8658): face-down = quiet/snooze, shake = stop/cancel
     //   * upright: the screen turns 180 degrees when the board stands upside down
-    //   * screen modes drawn by the board: dice (shake to roll) and timer countdown
+    //   * screen modes drawn by the board: dice (shake to roll), timer countdown, voice-notes recorder
     // ======================================================================
     int64_t last_tap_us_ = 0;
     i2c_master_dev_handle_t imu_ = nullptr;
@@ -661,6 +661,10 @@ AGENT_CODE = r"""
     }
 
     void UpdateModes() {  // LVGL lock held
+        if (notes_on_) {  // the recorder covers everything else until it closes
+            lv_obj_add_flag(mode_root_, LV_OBJ_FLAG_HIDDEN);
+            return;
+        }
         bool cam = cam_mode_ != 0;
         bool show = !modes_hidden_ && (cam || dice_on_ || timer_on_);
         if (!show) {
@@ -874,7 +878,20 @@ AGENT_CODE = r"""
         if (cam_mode_ != 0 && now > cam_until_ms_) {
             StopCamera();  // photo shown long enough / live view ran for 5 minutes
         }
-        if ((cam_mode_ != 0 || dice_on_ || timer_on_) && !modes_hidden_ && now - keep_awake_ms_ > 5000) {
+        if (notes_on_) {
+            NotesTick(now);
+            // the Pi hung up (or the Wi-Fi dropped): close the recorder rather than leave dead buttons
+            if (Application::GetInstance().GetDeviceState() == kDeviceStateIdle) {
+                if (notes_idle_ms_ == 0) {
+                    notes_idle_ms_ = now;
+                } else if (now - notes_idle_ms_ > 4000) {
+                    NotesClose();
+                }
+            } else {
+                notes_idle_ms_ = 0;
+            }
+        }
+        if ((notes_on_ || ((cam_mode_ != 0 || dice_on_ || timer_on_) && !modes_hidden_)) && now - keep_awake_ms_ > 5000) {
             keep_awake_ms_ = now;
             power_save_timer_->WakeUp();  // keep the screen on while there's something to see
         }
@@ -976,6 +993,457 @@ AGENT_CODE = r"""
                                      p["count"].value<int>(), p["seconds"].value<int>(), p["total"].value<int>(),
                                      p["label"].value<std::string>(), p["icon"].value<std::string>(),
                                      p["path"].value<std::string>());
+            });
+    }
+
+    // ------------------------------------------------- voice notes recorder
+    // The Pi owns the notes and decides what happens; the board draws the recorder and reports taps.
+    static constexpr uint32_t kRed = 0xFF4650;
+    static constexpr uint32_t kDim = 0x96A0AF;
+    static constexpr uint32_t kOff = 0x3C4650;
+    static constexpr int kBars = 30;
+    static constexpr int kNoteBtnY = DISPLAY_HEIGHT - 56 - 54 - kTop;  // centre of the four buttons
+    static constexpr int kNoteTimeY = 84 - 32;                         // top of the time digits
+    static constexpr int kWaveY = 150, kWaveH = 70;
+    enum { kNoteReady, kNoteRec, kNoteRecPaused, kNotePlay, kNotePlayPaused };
+
+    lv_obj_t* notes_root_ = nullptr;
+    lv_obj_t* notes_header_ = nullptr;
+    lv_obj_t* notes_dot_ = nullptr;
+    lv_obj_t* notes_close_ = nullptr;
+    lv_obj_t* notes_arrow_[2] = {};
+    lv_obj_t* notes_btn_[4] = {};  // record, pause, stop, play
+    lv_obj_t* notes_bar_[kBars] = {};
+    lv_obj_t* notes_seg_[4][7] = {};
+    lv_obj_t* notes_colon_[2] = {};
+    uint32_t notes_btn_color_[4] = {};
+    uint8_t notes_wave_[kBars] = {};
+    volatile bool notes_on_ = false;
+    int notes_state_ = kNoteReady;
+    int notes_digits_ = 0;
+    int notes_shown_s_ = -1;
+    int notes_base_s_ = 0;
+    int notes_total_s_ = 0;
+    int notes_lit_ = -1;
+    int64_t notes_t0_ms_ = 0;
+    int64_t notes_idle_ms_ = 0;
+
+    static void DrawNoteIcon(lv_event_t* e) {
+        auto* self = static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(lv_event_get_user_data(e));
+        lv_obj_t* obj = lv_event_get_current_target_obj(e);
+        lv_layer_t* layer = lv_event_get_layer(e);
+        lv_area_t a;
+        lv_obj_get_coords(obj, &a);
+        const int32_t cx = (a.x1 + a.x2) / 2, cy = (a.y1 + a.y2) / 2, s = 14;
+        int kind = -1;
+        uint32_t color = kDim;
+        for (int i = 0; i < 4; i++) {
+            if (obj == self->notes_btn_[i]) {
+                kind = i;
+                color = self->notes_btn_color_[i];
+            }
+        }
+        if (obj == self->notes_close_) {
+            kind = 4;
+        } else if (obj == self->notes_arrow_[0]) {
+            kind = 5;
+        } else if (obj == self->notes_arrow_[1]) {
+            kind = 6;
+        }
+        lv_draw_rect_dsc_t r;
+        lv_draw_rect_dsc_init(&r);
+        r.bg_color = lv_color_hex(color);
+        r.bg_opa = LV_OPA_COVER;
+        auto box = [&](int32_t x1, int32_t y1, int32_t x2, int32_t y2, int32_t radius) {
+            lv_area_t b = {x1, y1, x2, y2};
+            r.radius = radius;
+            lv_draw_rect(layer, &r, &b);
+        };
+        lv_draw_line_dsc_t l;
+        lv_draw_line_dsc_init(&l);
+        l.color = lv_color_hex(color);
+        l.width = 4;
+        l.round_start = 1;
+        l.round_end = 1;
+        auto line = [&](int32_t x1, int32_t y1, int32_t x2, int32_t y2) {
+            l.p1.x = x1;
+            l.p1.y = y1;
+            l.p2.x = x2;
+            l.p2.y = y2;
+            lv_draw_line(layer, &l);
+        };
+        switch (kind) {
+            case 0:  // record: a dot
+                box(cx - s, cy - s, cx + s, cy + s, LV_RADIUS_CIRCLE);
+                break;
+            case 1:  // pause: two bars
+                box(cx - 11, cy - s, cx - 5, cy + s, 3);
+                box(cx + 5, cy - s, cx + 11, cy + s, 3);
+                break;
+            case 2:  // stop: a square
+                box(cx - s + 2, cy - s + 2, cx + s - 2, cy + s - 2, 4);
+                break;
+            case 3: {  // play: a triangle
+                lv_draw_triangle_dsc_t t;
+                lv_draw_triangle_dsc_init(&t);
+                t.color = lv_color_hex(color);
+                t.opa = LV_OPA_COVER;
+                t.p[0].x = cx - 9;
+                t.p[0].y = cy - s;
+                t.p[1].x = cx - 9;
+                t.p[1].y = cy + s;
+                t.p[2].x = cx + s + 2;
+                t.p[2].y = cy;
+                lv_draw_triangle(layer, &t);
+                break;
+            }
+            case 4:  // close: X
+                line(cx - 9, cy - 9, cx + 9, cy + 9);
+                line(cx - 9, cy + 9, cx + 9, cy - 9);
+                break;
+            case 5:  // older note: <
+                line(cx + 7, cy - 16, cx - 7, cy);
+                line(cx - 7, cy, cx + 7, cy + 16);
+                break;
+            case 6:  // newer note: >
+                line(cx - 7, cy - 16, cx + 7, cy);
+                line(cx + 7, cy, cx - 7, cy + 16);
+                break;
+            default:
+                break;
+        }
+    }
+
+    static void OnNoteTap(lv_event_t* e) {
+        auto* self = static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(lv_event_get_user_data(e));
+        lv_obj_t* obj = lv_event_get_current_target_obj(e);
+        static const char* const kNames[4] = {"note_rec", "note_pause", "note_stop", "note_play"};
+        const char* name = nullptr;
+        for (int i = 0; i < 4; i++) {
+            if (obj == self->notes_btn_[i]) {
+                name = kNames[i];
+            }
+        }
+        if (obj == self->notes_close_) {
+            name = "note_close";
+        } else if (obj == self->notes_arrow_[0]) {
+            name = "note_prev";
+        } else if (obj == self->notes_arrow_[1]) {
+            name = "note_next";
+        }
+        if (name != nullptr) {
+            self->power_save_timer_->WakeUp();
+            self->SendGesture(name);
+        }
+    }
+
+    static void OnNotesSwipe(lv_event_t* e) {
+        auto* self = static_cast<WaveshareEsp32s3TouchAMOLED1inch8*>(lv_event_get_user_data(e));
+        lv_indev_t* indev = lv_indev_active();
+        if (indev == nullptr || self->notes_state_ == kNoteRec || self->notes_state_ == kNoteRecPaused) {
+            return;
+        }
+        lv_dir_t dir = lv_indev_get_gesture_dir(indev);
+        if (dir == LV_DIR_LEFT) {
+            self->SendGesture("note_next");  // like a photo gallery: swipe left for the next one
+        } else if (dir == LV_DIR_RIGHT) {
+            self->SendGesture("note_prev");
+        }
+    }
+
+    lv_obj_t* NoteTappable(int w, int h, int x, int y) {
+        lv_obj_t* o = lv_obj_create(notes_root_);
+        lv_obj_remove_style_all(o);
+        lv_obj_remove_flag(o, LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_add_flag(o, LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_set_size(o, w, h);
+        lv_obj_set_pos(o, x, y);
+        lv_obj_set_ext_click_area(o, 6);
+        lv_obj_add_event_cb(o, OnNoteTap, LV_EVENT_CLICKED, this);
+        lv_obj_add_event_cb(o, DrawNoteIcon, LV_EVENT_DRAW_MAIN_END, this);
+        return o;
+    }
+
+    void BuildNotes() {  // LVGL lock held
+        notes_root_ = Plain(lv_layer_top());
+        lv_obj_add_flag(notes_root_, LV_OBJ_FLAG_CLICKABLE);  // swallow taps: no double-tap chat toggle here
+        lv_obj_remove_flag(notes_root_, LV_OBJ_FLAG_GESTURE_BUBBLE);
+        lv_obj_add_event_cb(notes_root_, OnNotesSwipe, LV_EVENT_GESTURE, this);
+        lv_obj_set_size(notes_root_, kBoxW, kBoxH);
+        lv_obj_set_pos(notes_root_, 0, kTop);
+        lv_obj_set_style_bg_color(notes_root_, lv_color_black(), 0);
+        lv_obj_set_style_bg_opa(notes_root_, LV_OPA_COVER, 0);
+        lv_obj_add_flag(notes_root_, LV_OBJ_FLAG_HIDDEN);
+
+        notes_header_ = lv_label_create(notes_root_);
+        lv_obj_set_style_text_font(notes_header_, JV_TEXT_FONT, 0);
+        lv_obj_set_style_text_color(notes_header_, lv_color_hex(kDim), 0);
+        lv_label_set_long_mode(notes_header_, LV_LABEL_LONG_MODE_DOTS);
+        lv_obj_set_width(notes_header_, kBoxW - 130);
+        lv_obj_set_style_text_align(notes_header_, LV_TEXT_ALIGN_CENTER, 0);
+        lv_obj_align(notes_header_, LV_ALIGN_TOP_MID, 0, 6);
+        lv_label_set_text(notes_header_, "");
+        notes_dot_ = Plain(notes_root_);  // red "recording" dot
+        lv_obj_set_size(notes_dot_, 12, 12);
+        lv_obj_set_style_radius(notes_dot_, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_bg_color(notes_dot_, lv_color_hex(kRed), 0);
+        lv_obj_set_style_bg_opa(notes_dot_, LV_OPA_COVER, 0);
+        lv_obj_add_flag(notes_dot_, LV_OBJ_FLAG_HIDDEN);
+        notes_close_ = NoteTappable(56, 44, kBoxW - 58, 0);
+
+        notes_arrow_[0] = NoteTappable(64, 96, 0, 84 - 48);
+        notes_arrow_[1] = NoteTappable(64, 96, kBoxW - 64, 84 - 48);
+        for (auto& digit : notes_seg_) {
+            for (auto& seg : digit) {
+                seg = Plain(notes_root_);
+                lv_obj_set_style_bg_opa(seg, LV_OPA_COVER, 0);
+            }
+        }
+        for (auto& dot : notes_colon_) {
+            dot = Plain(notes_root_);
+            lv_obj_set_size(dot, 9, 9);
+            lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+        }
+        for (int i = 0; i < kBars; i++) {
+            lv_obj_t* bar = Plain(notes_root_);
+            lv_obj_set_style_radius(bar, 3, 0);
+            lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+            notes_bar_[i] = bar;
+        }
+        for (int i = 0; i < 4; i++) {
+            lv_obj_t* b = NoteTappable(76, 76, 52 + i * 88 - 38, kNoteBtnY - 38);
+            lv_obj_set_style_radius(b, LV_RADIUS_CIRCLE, 0);
+            lv_obj_set_style_border_width(b, 4, 0);
+            lv_obj_set_style_border_opa(b, LV_OPA_COVER, 0);
+            lv_obj_set_style_bg_opa(b, LV_OPA_40, LV_STATE_PRESSED);
+            notes_btn_[i] = b;
+        }
+    }
+
+    void NotesShowTime(int s) {  // LVGL lock held: M:SS (or MM:SS) in 7-segment digits
+        s = std::clamp(s, 0, 99 * 60 + 59);
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%d%02d", s / 60, s % 60);
+        int n = (int)strlen(buf);
+        static const uint8_t kSeg[10] = {0x3F, 0x06, 0x5B, 0x4F, 0x66, 0x6D, 0x7D, 0x07, 0x7F, 0x6F};
+        const uint32_t color = notes_state_ == kNoteRec || notes_state_ == kNoteRecPaused ? kRed : kCyan;
+        const int h = 64, w = h * 52 / 100, t = std::max(8, h * 114 / 1000), in = h * 9 / 100;
+        const int half = h / 2 - h * 136 / 1000, gap = h * 11 / 100, colon_w = 14;
+        const int geo[7][4] = {{in, 0, w - 2 * in, t},           {w - t, in, t, half},
+                               {w - t, h / 2 + in / 2, t, half}, {in, h - t, w - 2 * in, t},
+                               {0, h / 2 + in / 2, t, half},     {0, in, t, half},
+                               {in, h / 2 - t / 2, w - 2 * in, t}};
+        int x = (kBoxW - (n * w + colon_w + n * gap)) / 2;
+        for (int d = 0; d < 4; d++) {
+            for (int k = 0; k < 7; k++) {
+                lv_obj_t* seg = notes_seg_[d][k];
+                if (d >= n) {
+                    lv_obj_add_flag(seg, LV_OBJ_FLAG_HIDDEN);
+                    continue;
+                }
+                lv_obj_remove_flag(seg, LV_OBJ_FLAG_HIDDEN);
+                lv_obj_set_style_bg_color(seg, lv_color_hex(color), 0);
+                lv_obj_set_style_bg_opa(seg, (kSeg[buf[d] - '0'] >> k) & 1 ? LV_OPA_COVER : LV_OPA_10, 0);
+                if (n != notes_digits_) {
+                    lv_obj_set_style_radius(seg, t / 2, 0);
+                }
+            }
+            if (d >= n) {
+                continue;
+            }
+            if (d == n - 2) {
+                for (int k = 0; k < 2; k++) {
+                    lv_obj_set_style_bg_color(notes_colon_[k], lv_color_hex(color), 0);
+                    lv_obj_set_pos(notes_colon_[k], x + (colon_w - 9) / 2,
+                                   kNoteTimeY + h / 2 + (k ? h / 6 : -h / 6 - 9));
+                }
+                x += colon_w + gap;
+            }
+            for (int k = 0; k < 7; k++) {
+                lv_obj_set_pos(notes_seg_[d][k], x + geo[k][0], kNoteTimeY + geo[k][1]);
+                lv_obj_set_size(notes_seg_[d][k], geo[k][2], geo[k][3]);
+            }
+            x += w + gap;
+        }
+        notes_digits_ = n;
+    }
+
+    void NotesPaintBars() {  // LVGL lock held
+        const bool rec = notes_state_ == kNoteRec || notes_state_ == kNoteRecPaused;
+        for (int i = 0; i < kBars; i++) {
+            int level = std::min<int>(notes_wave_[i], 9);
+            int h = 8 + level * (kWaveH - 8) / 9;
+            lv_obj_t* bar = notes_bar_[i];
+            lv_obj_set_size(bar, 6, h);
+            lv_obj_set_pos(bar, 30 + i * (kBoxW - 60) / (kBars - 1) - 3, kWaveY + (kWaveH - h) / 2);
+            uint32_t color;
+            lv_opa_t opa;
+            if (rec) {
+                color = kRed;
+                opa = notes_state_ == kNoteRec ? LV_OPA_90 : LV_OPA_40;
+            } else if (notes_state_ == kNotePlay || notes_state_ == kNotePlayPaused) {
+                color = kCyan;
+                opa = i < notes_lit_ ? LV_OPA_COVER : LV_OPA_30;
+            } else {
+                color = kDim;
+                opa = LV_OPA_40;
+            }
+            lv_obj_set_style_bg_color(bar, lv_color_hex(color), 0);
+            lv_obj_set_style_bg_opa(bar, opa, 0);
+        }
+    }
+
+    void NotesPaint() {  // LVGL lock held
+        const int st = notes_state_;
+        const bool rec = st == kNoteRec || st == kNoteRecPaused;
+        const bool play = st == kNotePlay || st == kNotePlayPaused;
+        //                        record                pause                            stop                  play
+        uint32_t ready[4] = {kRed, kOff, kOff, notes_total_s_ > 0 ? kCyan : kOff};
+        uint32_t recording[4] = {kRed, kRed, kRed, kOff};
+        uint32_t playing[4] = {kRed, kCyan, kCyan, kCyan};
+        const uint32_t* colors = rec ? recording : play ? playing : ready;
+        const int filled = st == kNoteRec ? 0 : st == kNotePlay ? 3 : (st == kNoteRecPaused || st == kNotePlayPaused) ? 1 : -1;
+        for (int i = 0; i < 4; i++) {
+            notes_btn_color_[i] = colors[i];
+            lv_obj_t* b = notes_btn_[i];
+            lv_color_t c = lv_color_hex(colors[i]);
+            lv_obj_set_style_border_color(b, c, 0);
+            lv_obj_set_style_bg_color(b, c, 0);
+            lv_obj_set_style_bg_opa(b, i == filled ? LV_OPA_20 : LV_OPA_TRANSP, 0);
+            lv_obj_invalidate(b);
+        }
+        lv_obj_set_style_text_color(notes_header_, lv_color_hex(rec ? kRed : play ? kCyan : kDim), 0);
+        for (auto* arrow : notes_arrow_) {
+            if (rec) {
+                lv_obj_add_flag(arrow, LV_OBJ_FLAG_HIDDEN);
+            } else {
+                lv_obj_remove_flag(arrow, LV_OBJ_FLAG_HIDDEN);
+            }
+        }
+        if (rec) {
+            lv_obj_update_layout(notes_root_);
+            lv_point_t first = {0, 0};
+            lv_label_get_letter_pos(notes_header_, 0, &first);  // the dot sits just before the text
+            lv_obj_set_pos(notes_dot_, lv_obj_get_x(notes_header_) + first.x - 22,
+                           lv_obj_get_y(notes_header_) + lv_font_get_line_height(JV_TEXT_FONT) / 2 - 6);
+            lv_obj_remove_flag(notes_dot_, LV_OBJ_FLAG_HIDDEN);
+            lv_obj_set_style_bg_opa(notes_dot_, st == kNoteRec ? LV_OPA_COVER : LV_OPA_40, 0);
+        } else {
+            lv_obj_add_flag(notes_dot_, LV_OBJ_FLAG_HIDDEN);
+        }
+        notes_shown_s_ = -1;
+        notes_lit_ = -1;
+        NotesTick(NowMs());
+        NotesPaintBars();
+    }
+
+    void NotesTick(int64_t now) {  // LVGL lock held
+        const bool running = notes_state_ == kNoteRec || notes_state_ == kNotePlay;
+        int s = notes_base_s_ + (running ? (int)((now - notes_t0_ms_) / 1000) : 0);
+        if (notes_state_ == kNotePlay && notes_total_s_ > 0) {
+            s = std::min(s, notes_total_s_);
+        }
+        if (s != notes_shown_s_) {
+            notes_shown_s_ = s;
+            NotesShowTime(s);
+        }
+        if (notes_state_ == kNotePlay || notes_state_ == kNotePlayPaused) {
+            int64_t ms = (int64_t)notes_base_s_ * 1000 + (running ? now - notes_t0_ms_ : 0);
+            int lit = notes_total_s_ > 0 ? (int)std::min<int64_t>(kBars, ms * kBars / (notes_total_s_ * 1000LL)) : 0;
+            if (lit != notes_lit_) {
+                notes_lit_ = lit;
+                NotesPaintBars();
+            }
+        }
+    }
+
+    void NotesClose() {  // LVGL lock held
+        notes_on_ = false;
+        lv_obj_add_flag(notes_root_, LV_OBJ_FLAG_HIDDEN);
+        UpdateModes();
+    }
+
+    ReturnValue NotesCommand(const std::string& state, const std::string& header, const std::string& caption,
+                             int seconds, int total, const std::string& levels, int level) {
+        if (notes_root_ == nullptr || !lvgl_port_lock(1000)) {
+            return false;
+        }
+        if (state == "off") {
+            if (notes_on_) {
+                NotesClose();
+            }
+            lvgl_port_unlock();
+            return std::string("notes");
+        }
+        if (state == "level") {  // live microphone level while recording: the strip scrolls left
+            if (notes_on_ && notes_state_ == kNoteRec) {
+                memmove(notes_wave_, notes_wave_ + 1, kBars - 1);
+                notes_wave_[kBars - 1] = (uint8_t)std::clamp(level * 9 / 100, 0, 9);
+                NotesPaintBars();
+            }
+            lvgl_port_unlock();
+            return std::string("notes");
+        }
+        static const char* const kStates[5] = {"ready", "rec", "rec_paused", "play", "play_paused"};
+        int st = -1;
+        for (int i = 0; i < 5; i++) {
+            if (state == kStates[i]) {
+                st = i;
+            }
+        }
+        if (st < 0 || header.size() > 120 || caption.size() > 400) {
+            lvgl_port_unlock();
+            return false;
+        }
+        if (st == kNoteRec && notes_state_ != kNoteRec && notes_state_ != kNoteRecPaused) {
+            memset(notes_wave_, 0, sizeof(notes_wave_));  // a new recording starts with a flat strip
+        }
+        if (!levels.empty()) {
+            for (int i = 0; i < kBars; i++) {
+                char c = i < (int)levels.size() ? levels[i] : '0';
+                notes_wave_[i] = (uint8_t)(c >= '0' && c <= '9' ? c - '0' : 0);
+            }
+        }
+        notes_state_ = st;
+        notes_base_s_ = std::max(0, seconds);
+        notes_total_s_ = std::max(0, total);
+        notes_t0_ms_ = NowMs();
+        notes_idle_ms_ = 0;
+        lv_label_set_text(notes_header_, header.c_str());
+        notes_on_ = true;
+        NotesPaint();
+        lv_obj_remove_flag(notes_root_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_move_foreground(notes_root_);
+        UpdateModes();
+        if (!caption.empty()) {
+            display_->SetChatMessage("system", caption.c_str());
+        }
+        lvgl_port_unlock();
+        return std::string("notes");
+    }
+
+    void InitializeNotesTool() {
+        if (lvgl_port_lock(0)) {
+            BuildNotes();
+            lvgl_port_unlock();
+        }
+        McpServer::GetInstance().AddTool(
+            "self.jarvis.notes",
+            "Pi-Esp Jarvis voice-notes recorder screen, used by the Pi server: state = ready | rec | rec_paused | "
+            "play | play_paused | level | off.",
+            PropertyList({Property("state", kPropertyTypeString),
+                          Property("header", kPropertyTypeString, std::string("")),
+                          Property("caption", kPropertyTypeString, std::string("")),
+                          Property("seconds", kPropertyTypeInteger, 0),
+                          Property("total", kPropertyTypeInteger, 0),
+                          Property("levels", kPropertyTypeString, std::string("")),
+                          Property("level", kPropertyTypeInteger, 0)}),
+            [this](const PropertyList& p) -> ReturnValue {
+                return NotesCommand(p["state"].value<std::string>(), p["header"].value<std::string>(),
+                                    p["caption"].value<std::string>(), p["seconds"].value<int>(),
+                                    p["total"].value<int>(), p["levels"].value<std::string>(),
+                                    p["level"].value<int>());
             });
     }
 
@@ -1102,6 +1570,7 @@ AGENT_CODE = r"""
         up_axis_ = settings.GetInt("up_axis", JV_UP_AXIS);  // board default; "flip the screen" overrides it
         up_sign_ = settings.GetInt("up_sign", JV_UP_SIGN) < 0 ? -1 : 1;
         InitializeScreenModes();
+        InitializeNotesTool();
         InitializeWifiTool();
         xTaskCreate(WakeChannelTask, "wake_channel", 6144, this, 2, nullptr);
         if (InitializeImu()) {
@@ -1152,7 +1621,9 @@ if "InitializeAgentExtras" not in text:
                  "#include \"mcp_server.h\"\n#include <ssid_manager.h>\n#include <cstring>\n"
                  "#include <esp_heap_caps.h>\n#include \"jpeg_to_image.h\"\n#include <src/misc/cache/lv_cache.h>\n#include <atomic>\n"
                  f"#define JV_FLIP_OFFSET_X {flip_x}\n#define JV_FLIP_OFFSET_Y {flip_y}\n"
-                 f"#define JV_UP_AXIS {up_axis}\n#define JV_UP_SIGN {up_sign}")
+                 f"#define JV_UP_AXIS {up_axis}\n#define JV_UP_SIGN {up_sign}\n"
+                 "#ifdef BUILTIN_TEXT_FONT\nLV_FONT_DECLARE(BUILTIN_TEXT_FONT);\n#define JV_TEXT_FONT (&BUILTIN_TEXT_FONT)\n"
+                 "#else\n#define JV_TEXT_FONT LV_FONT_DEFAULT\n#endif")
     text = text.replace("#include <lvgl.h>", "#include <lvgl.h>\n" + extra_inc, 1)
     src.write_text(text, encoding="utf-8")
-print("patched: double-tap, wake channel, gestures, upright screen, dice and timer screens")
+print("patched: double-tap, wake channel, gestures, upright screen, dice, timer and voice-notes screens")

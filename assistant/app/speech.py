@@ -74,6 +74,36 @@ class SpeechToText:
             return ""
         return text
 
+    def transcribe_note(self, pcm16: bytes) -> str:
+        """A whole voice note: slower and more careful than a spoken command, with paragraphs on long pauses."""
+        self.load()
+        audio = np.frombuffer(pcm16, dtype=np.int16).astype(np.float32) / 32768.0
+        if len(audio) < MIC_RATE // 2:
+            return ""
+        options = dict(language=config.WHISPER_LANGUAGE or None, beam_size=3, condition_on_previous_text=False)
+        try:
+            segments, _info = self._model.transcribe(audio, vad_filter=True, **options)
+            segments = list(segments)
+        except Exception as exc:  # the VAD model can be missing on odd installs: do without it
+            log.warning("Transcribing without VAD (%s)", exc)
+            segments, _info = self._model.transcribe(audio, vad_filter=False, **options)
+            segments = list(segments)
+        out, last_end = "", None
+        for seg in segments:
+            if seg.no_speech_prob > 0.8 and seg.avg_logprob < -1.0:
+                continue
+            text = seg.text.strip()
+            if not text:
+                continue
+            if last_end is not None:
+                out += "\n\n" if seg.start - last_end > 3.0 else " "
+            out += text
+            last_end = seg.end
+        normalized = re.sub(r"[^a-z. ]", "", out.lower()).strip(" .")
+        if normalized in self._HALLUCINATIONS and len(audio) < MIC_RATE * 4:
+            return ""
+        return out.strip()
+
 
 # ----------------------------------------------------------------------------
 # Text to speech

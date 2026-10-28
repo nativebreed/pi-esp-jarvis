@@ -6,6 +6,7 @@ HTTP  GET /health              -> status JSON
 HTTP  GET /xiaozhi/events      -> long-poll: the device waits here to be woken (alarms, timers)
 HTTP  POST /xiaozhi/gesture    -> motion gestures from the device while it is idle
 HTTP  GET /lists               -> shopping / to-do lists and memories in a browser
+HTTP  GET /notes               -> voice notes: play, read, download, delete
 """
 from __future__ import annotations
 
@@ -20,10 +21,11 @@ import uuid
 
 from aiohttp import WSMsgType, web
 
-from . import camera, config, music, screen, sounds, web_ui
+from . import camera, config, music, notes, screen, sounds, web_ui
 from .brain import Brain, Conversation, is_goodbye, match_claude_trigger, sentences
 from .clock import Alert, Clock
 from .pihelper import PiHelper
+from .recorder import Recorder
 from .reply import Reply
 from .skills import _YES, Skills
 from .store import Store
@@ -70,6 +72,8 @@ def deliver_alerts() -> None:
 
 
 STORE = Store()
+NOTES = notes.NoteStore()
+TRANSCRIBER = notes.Transcriber(NOTES, STT, BRAIN)
 CLOCK = Clock(STORE, on_alert)
 WEATHER = Weather()
 HELPER = PiHelper()
@@ -155,6 +159,7 @@ class Session:
         self.dice_until = 0.0
         self.cam_screen: str | None = None        # "photo" / "live" while the camera is on the board's screen
         self.cam_screen_until = 0.0
+        self.notes = Recorder(self, NOTES, TRANSCRIBER)
 
     # ---------------------------------------------------------------- sending
     async def send_json(self, **msg) -> None:
@@ -221,6 +226,7 @@ class Session:
                     self.listening = False
             # "detect" (wake word) needs no action: listen/start follows it
         elif kind == "abort":
+            self.notes.interrupted()
             if self.playing:  # remember where the music was, for resume / volume
                 self.player.paused_at = time.monotonic()
             if self.ringing:  # interrupted an alarm: wait for "stop" or "snooze"
@@ -244,6 +250,9 @@ class Session:
         self.last_activity = time.monotonic()
 
     def on_audio(self, packet: bytes) -> None:
+        if self.notes.feed(packet):  # recording a voice note: the audio is the note, not a question
+            self.last_activity = time.monotonic()
+            return
         if not self.listening:
             return
         pcm = self.decoder.decode(packet)
@@ -296,6 +305,12 @@ class Session:
                     await self.deliver(reply, text)
                     return
 
+            if self.notes.active:
+                kind = notes.recorder_command(text)
+                if kind:
+                    await self.notes.voice(kind)
+                    return
+
             if is_goodbye(text):
                 await self.send_json(type="tts", state="start")
                 await self.speak("Goodbye!")
@@ -312,6 +327,13 @@ class Session:
 
             if self.camera_showing() and camera.CAM_OFF_RE.match(text):
                 await self.camera_off()
+                return
+
+            note_cmd = notes.parse_command(text)
+            if note_cmd:
+                reply = await self.notes.command(note_cmd)
+                if reply:
+                    await self.deliver(reply, text)
                 return
 
             if WIFI_RE.match(text):
@@ -476,6 +498,7 @@ class Session:
     async def _begin_alerts(self) -> None:
         if self.playing:
             self.player.paused_at = time.monotonic()
+        self.notes.interrupted()          # pause a recording or a note being played
         await self.cancel_turn()          # stop whatever was playing or being said
         self.listening = False
         self.turn_task = asyncio.create_task(self.ring_alerts())
@@ -562,6 +585,9 @@ class Session:
 
     async def on_gesture(self, kind: str) -> None:
         log.info("[%s] gesture %s", self.device_id, kind)
+        if kind.startswith("note_"):  # a tap on the board's recorder
+            asyncio.create_task(self.notes.button(kind[5:]))
+            return
         alert = self.ringing or self.alert_waiting
         if alert:
             self.ringing = self.alert_waiting = None
@@ -570,6 +596,8 @@ class Session:
             reply = Reply(msg, emotion="sleepy", end=not PENDING)
             self.turn_task = asyncio.create_task(self.deliver(self._then_more_alerts(reply), ""))
             return
+        if self.notes.active or self.notes.busy:
+            return  # picking the board up to record shouldn't hang up
         if kind in ("face_down", "shake"):  # "be quiet" / "never mind"
             if self.playing:
                 self.player.paused_at = time.monotonic()
@@ -996,6 +1024,16 @@ class Session:
                 log.warning("[%s] could not play %s: %s", self.device_id, track.source, err[-300:])
         return got_audio
 
+    async def device_tool_nowait(self, name: str, arguments: dict | None = None) -> None:
+        """Call a device tool without waiting for its answer (live level meter)."""
+        self.mcp_next_id += 1
+        try:
+            await self.send_json(type="mcp", payload={
+                "jsonrpc": "2.0", "method": "tools/call", "id": self.mcp_next_id,
+                "params": {"name": name, "arguments": arguments or {}}})
+        except Exception:
+            pass
+
     async def device_tool(self, name: str, arguments: dict | None = None) -> dict | None:
         """Call one of the device's built-in MCP tools (volume, brightness, ...)."""
         self.mcp_next_id += 1
@@ -1038,6 +1076,10 @@ class Session:
             await asyncio.sleep(1)
             if self.alerting:
                 continue  # an alarm or timer is ringing (or about to)
+            if self.notes.active or self.notes.busy:
+                self.notes.tick()
+                self.last_activity = time.monotonic()
+                continue  # the recorder is open: stay connected until it closes
             busy = self.turn_task is not None and not self.turn_task.done()
             if not self.alerting and self.screen_ok is not False and self.timer_signature() != self.screen_sig:
                 asyncio.create_task(self.sync_screen())
@@ -1076,6 +1118,10 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
         if SESSIONS.get(device_id) is session:
             del SESSIONS[device_id]
         await session.cancel_turn()
+        try:
+            await session.notes.disconnected()
+        except Exception:
+            log.exception("[%s] could not save the voice note", device_id)
         log.info("[%s] disconnected", device_id)
         if PENDING:
             deliver_alerts()
@@ -1139,7 +1185,14 @@ async def on_startup(app: web.Application) -> None:
     app["bg"] = [asyncio.create_task(warm_speech()),
                  asyncio.create_task(BRAIN.prepare_local_model()),
                  asyncio.create_task(CLOCK.run()),
-                 asyncio.create_task(WEATHER.home())]
+                 asyncio.create_task(WEATHER.home()),
+                 asyncio.create_task(TRANSCRIBER.run())]
+    try:
+        NOTES.ensure()
+        log.info("Voice notes: %s (%d so far, Claude tidy-up %s)", NOTES.dir, len(NOTES.ids()),
+                 "on" if config.NOTES_CLAUDE and BRAIN.claude_available else "off")
+    except OSError as exc:
+        log.error("Voice notes folder %s isn't usable: %s", NOTES.dir, exc)
     log.info("Claude: %s", f"enabled ({config.CLAUDE_MODEL})" if BRAIN.claude_available
              else "not configured (set ANTHROPIC_API_KEY in .env)")
     if CAMERA.present:
@@ -1188,7 +1241,7 @@ def make_app() -> web.Application:
     app.router.add_post("/xiaozhi/gesture", gesture)
     app.router.add_get("/xiaozhi/camera/photo.jpg", camera_photo_http)
     app.router.add_get("/xiaozhi/camera/live.jpg", camera_live_http)
-    web_ui.add_routes(app, STORE, on_wifi=wifi_added)
+    web_ui.add_routes(app, STORE, on_wifi=wifi_added, notes=NOTES, transcriber=TRANSCRIBER)
     app.on_startup.append(on_startup)
     return app
 

@@ -2,17 +2,22 @@
 
 Open http://<pi>:8000/lists on any device on your home network.
 http://<pi>:8000/wifi adds Wi-Fi networks for the board, typed on a proper keyboard.
+http://<pi>:8000/notes plays, reads, downloads and deletes voice notes.
 """
 from __future__ import annotations
 
+import asyncio
 import html
+import io
 import time
+import wave
 from urllib.parse import quote
 
 from typing import Callable, Optional
 
 from aiohttp import web
 
+from .notes import ID_RE, Note, NoteStore, Transcriber, decode_pcm16
 from .store import Store
 
 PAGE = """<!doctype html>
@@ -48,7 +53,7 @@ PAGE = """<!doctype html>
 </style></head>
 <body><main>
 <h1><span>●</span> Jarvis</h1>
-<nav><a class="on" href="/lists">Lists</a><a href="/wifi">Wi-Fi</a></nav>
+<nav><a class="on" href="/lists">Lists</a><a href="/notes">Voice notes</a><a href="/wifi">Wi-Fi</a></nav>
 {sections}
 <section>
   <h2>New list</h2>
@@ -89,7 +94,7 @@ WIFI_PAGE = """<!doctype html>
 </style></head>
 <body><main>
 <h1><span>●</span> Jarvis</h1>
-<nav><a href="/lists">Lists</a><a class="on" href="/wifi">Wi-Fi</a></nav>
+<nav><a href="/lists">Lists</a><a href="/notes">Voice notes</a><a class="on" href="/wifi">Wi-Fi</a></nav>
 {notice}
 <section>
   <h2>Add a Wi-Fi network</h2>
@@ -112,6 +117,107 @@ WIFI_PAGE = """<!doctype html>
 <p class="small">Jarvis collects new networks the next time it talks to the Pi: say "Jarvis" or double-tap the screen.
 The password is kept on the Pi only until Jarvis has it. Moving somewhere new? Add the network here <em>before</em> you go.</p>
 </main></body></html>"""
+
+
+NOTES_PAGE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">{refresh}
+<title>Jarvis voice notes</title>
+<style>
+  :root {{ --bg:#0b0d12; --card:#151922; --line:#232a36; --text:#e8ecf2; --muted:#8a94a6; --accent:#2ee6ff; --rec:#ff4650; }}
+  * {{ box-sizing:border-box; }}
+  body {{ margin:0; background:var(--bg); color:var(--text); font:16px/1.45 system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }}
+  main {{ max-width:640px; margin:0 auto; padding:20px 16px 60px; }}
+  h1 {{ font-size:22px; margin:6px 0 18px; }} h1 span {{ color:var(--accent); }}
+  nav {{ display:flex; gap:14px; margin:-8px 0 16px; font-size:14px; }}
+  nav a {{ color:var(--muted); text-decoration:none; }} nav a.on {{ color:var(--accent); }}
+  section {{ background:var(--card); border:1px solid var(--line); border-radius:14px; padding:14px; margin-bottom:14px; }}
+  .search {{ display:flex; gap:8px; margin-bottom:16px; }}
+  .search input {{ flex:1; min-width:0; font:inherit; color:var(--text); background:#0f131a; border:1px solid var(--line);
+    border-radius:9px; padding:8px 10px; }}
+  button, a.btn {{ font:inherit; font-size:14px; color:var(--text); background:transparent; border:1px solid var(--line);
+    border-radius:9px; padding:5px 11px; cursor:pointer; text-decoration:none; display:inline-block; }}
+  .search button {{ background:var(--accent); color:#000; border-color:var(--accent); font-weight:600; }}
+  .head {{ display:flex; justify-content:space-between; align-items:baseline; gap:10px; }}
+  .title {{ font-weight:600; font-size:17px; word-break:break-word; }}
+  .when {{ font-size:13px; color:var(--muted); white-space:nowrap; }}
+  .wave {{ display:flex; align-items:center; gap:3px; height:30px; margin:10px 0 4px; }}
+  .wave i {{ flex:1; background:var(--accent); opacity:.55; border-radius:2px; min-height:3px; }}
+  audio {{ width:100%; margin:6px 0 4px; height:36px; color-scheme:dark; }}
+  .text {{ white-space:pre-wrap; margin:8px 0 4px; }}
+  details {{ margin:6px 0; font-size:14px; color:var(--muted); }} details .text {{ color:var(--text); }}
+  .tag {{ font-size:12px; border-radius:99px; padding:2px 8px; border:1px solid var(--line); color:var(--muted); }}
+  .tag.wait {{ color:var(--accent); border-color:#1d4150; }}
+  .actions {{ display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }}
+  .actions form {{ margin:0; }} .actions .del {{ color:var(--rec); border-color:#4a2228; margin-left:auto; }}
+  .small {{ font-size:13px; color:var(--muted); }} .empty {{ color:var(--muted); }}
+  mark {{ background:#2a4b55; color:var(--text); border-radius:3px; }}
+</style></head>
+<body><main>
+<h1><span>●</span> Jarvis</h1>
+<nav><a href="/lists">Lists</a><a class="on" href="/notes">Voice notes</a><a href="/wifi">Wi-Fi</a></nav>
+<form class="search" method="get" action="/notes"><input name="q" value="{q}" placeholder="Search what you said…">
+<button>Search</button></form>
+{summary}
+{cards}
+<p class="small">Say "Jarvis, go into voice notes" or "take a note". Notes are kept on the Pi in the
+<b>voice-notes</b> folder, named by date and time (YYYYMMDDHHMMSS), with a .txt transcript beside each one.</p>
+</main></body></html>"""
+
+
+def _fmt_len(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 60}:{s % 60:02d}"
+
+
+def _note_card(note: Note, transcript: str, busy: bool, q: str) -> str:
+    t = note.when
+    when = time.strftime("%a %d %b %Y, %H:%M", t)
+    title = html.escape(note.title or ("Writing it down…" if note.status == "pending" else "Untitled note"))
+    bars = "".join(f'<i style="height:{12 + int(c) * 10}%"></i>' for c in (note.wave or "0" * 30) if c.isdigit())
+    tag = ""
+    if note.status == "pending":
+        tag = '<span class="tag wait">' + ("transcribing now" if busy else "waiting to be transcribed") + "</span>"
+    elif note.status == "empty":
+        tag = '<span class="tag">no words heard</span>'
+    elif note.status == "failed":
+        tag = '<span class="tag">transcript failed</span>'
+
+    def mark(text: str) -> str:
+        out = html.escape(text)
+        for w in {w for w in q.split() if len(w) > 1}:
+            low, wl = out.lower(), html.escape(w).lower()
+            i, res = 0, ""
+            while True:
+                j = low.find(wl, i)
+                if j < 0:
+                    res += out[i:]
+                    break
+                res += out[i:j] + "<mark>" + out[j:j + len(wl)] + "</mark>"
+                i = j + len(wl)
+            out = res
+        return out
+
+    body = ""
+    if note.tidy:
+        body = f'<div class="text">{mark(note.tidy)}</div>'
+        if transcript:
+            body += f'<details><summary>What Whisper heard</summary><div class="text">{mark(transcript)}</div></details>'
+    elif transcript:
+        body = f'<div class="text">{mark(transcript)}</div>'
+    nid = note.id
+    return (f'<section id="n{nid}"><div class="head"><span class="title">{title}</span>'
+            f'<span class="when">{when} · {_fmt_len(note.seconds)}</span></div>'
+            f'<div class="wave">{bars}</div>'
+            f'<audio controls preload="none"><source src="/notes/audio/{nid}.ogg" type="audio/ogg; codecs=opus">'
+            f'<source src="/notes/audio/{nid}.wav" type="audio/wav"></audio>'
+            f'{tag}{body}'
+            f'<div class="actions"><a class="btn" href="/notes/audio/{nid}.ogg?download=1">Download audio</a>'
+            + (f'<a class="btn" href="/notes/text/{nid}.txt">Transcript</a>' if transcript else "")
+            + (f'<form method="post" action="/notes/redo"><input type="hidden" name="id" value="{nid}">'
+               f'<button title="Run the transcript again">Re-transcribe</button></form>' if note.status != "pending" else "")
+            + f'<form method="post" action="/notes/delete" onsubmit="return confirm(\'Delete this voice note? This can\\\'t be undone.\')">'
+            f'<input type="hidden" name="id" value="{nid}"><button class="del">Delete</button></form></div></section>')
 
 
 def _wifi_rows(store: Store) -> str:
@@ -156,7 +262,8 @@ def _memory_section(mems: list[dict]) -> str:
             f'<button>Add</button></form></section>')
 
 
-def add_routes(app: web.Application, store: Store, on_wifi: Optional[Callable[[], None]] = None) -> None:
+def add_routes(app: web.Application, store: Store, on_wifi: Optional[Callable[[], None]] = None,
+               notes: Optional[NoteStore] = None, transcriber: Optional[Transcriber] = None) -> None:
     async def page(_req: web.Request) -> web.Response:
         names = store.list_names()
         ordered = [n for n in ("shopping", "to-do") if n in names] + sorted(n for n in names if n not in ("shopping", "to-do"))
@@ -238,6 +345,82 @@ def add_routes(app: web.Application, store: Store, on_wifi: Optional[Callable[[]
         store.remove("wifi_pending", {str(f.get("id", ""))})
         raise web.HTTPSeeOther("/wifi")
 
+    # ------------------------------------------------------------ voice notes
+    def note_id(req: web.Request) -> str:
+        nid = req.match_info.get("id", "")
+        if not notes or not ID_RE.match(nid) or not notes.path(nid, "ogg").exists():
+            raise web.HTTPNotFound()
+        return nid
+
+    async def notes_page(req: web.Request) -> web.Response:
+        q = req.query.get("q", "").strip()[:100]
+        found = notes.search(q) if (notes and q) else (list(reversed(notes.all())) if notes else [])
+        busy = transcriber.busy if transcriber else None
+        cards = "".join(_note_card(n, notes.transcript(n.id), busy == n.id, q) for n in found)
+        total = len(notes.ids()) if notes else 0
+        if q:
+            summary = (f'<p class="small">{len(found)} of {total} notes match “{html.escape(q)}”. '
+                       f'<a href="/notes" style="color:var(--accent)">Show all</a></p>')
+        else:
+            summary = (f'<p class="small">{total} note{"s" if total != 1 else ""}, newest first.</p>' if total else "")
+        if not cards:
+            cards = ('<section class="empty">No notes match that.</section>' if q else
+                     '<section class="empty">No voice notes yet. Say “Jarvis, take a note”.</section>')
+        refresh = '\n<meta http-equiv="refresh" content="15">' if any(n.status == "pending" for n in found) else ""
+        return web.Response(text=NOTES_PAGE.format(refresh=refresh, q=html.escape(q), summary=summary, cards=cards),
+                            content_type="text/html")
+
+    async def note_audio(req: web.Request) -> web.StreamResponse:
+        nid = note_id(req)
+        headers = {"Cache-Control": "no-cache"}
+        if req.query.get("download"):
+            headers["Content-Disposition"] = f'attachment; filename="{nid}.ogg"'
+        return web.FileResponse(notes.path(nid, "ogg"), headers={**headers, "Content-Type": "audio/ogg"})
+
+    async def note_wav(req: web.Request) -> web.Response:
+        """The same note as WAV, for browsers that can't play Opus in Ogg (older iPhones)."""
+        nid = note_id(req)
+        pcm = await asyncio.to_thread(decode_pcm16, notes.path(nid, "ogg"))
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(16000)
+            w.writeframes(pcm)
+        return web.Response(body=buf.getvalue(), content_type="audio/wav")
+
+    async def note_text(req: web.Request) -> web.Response:
+        nid = note_id(req)
+        note = notes.get(nid)
+        text = notes.transcript(nid)
+        if note and note.tidy:
+            text = f"{note.title}\n\n{note.tidy}\n\n--- transcript ---\n{text}"
+        return web.Response(text=text + "\n", content_type="text/plain", charset="utf-8",
+                            headers={"Content-Disposition": f'inline; filename="{nid}.txt"'})
+
+    async def note_delete(req: web.Request):
+        f = await req.post()
+        nid = str(f.get("id", ""))
+        if notes and ID_RE.match(nid):
+            notes.delete(nid)
+        raise web.HTTPSeeOther("/notes")
+
+    async def note_redo(req: web.Request):
+        f = await req.post()
+        nid = str(f.get("id", ""))
+        note = notes.get(nid) if (notes and ID_RE.match(nid)) else None
+        if note and transcriber:
+            note.status = "pending"
+            notes.save_meta(note)
+            transcriber.add(nid)
+        raise web.HTTPSeeOther(f"/notes#n{nid}")
+
+    app.router.add_get("/notes", notes_page)
+    app.router.add_get("/notes/audio/{id}.ogg", note_audio)
+    app.router.add_get("/notes/audio/{id}.wav", note_wav)
+    app.router.add_get("/notes/text/{id}.txt", note_text)
+    app.router.add_post("/notes/delete", note_delete)
+    app.router.add_post("/notes/redo", note_redo)
     app.router.add_get("/wifi", wifi_page)
     app.router.add_post("/wifi/add", wifi_add)
     app.router.add_post("/wifi/remove", wifi_remove)
