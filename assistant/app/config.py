@@ -22,8 +22,8 @@ DATA_DIR = Path(_env("DATA_DIR", "/data"))
 PORT = int(_env("PORT", "8000"))
 # Leave empty to auto-detect from the address the device used to reach us.
 PUBLIC_WS_URL = _env("PUBLIC_WS_URL", "")
-# Optional shared secret. If set, the device must present it (it gets it
-# automatically from the OTA endpoint, so this only stops other clients).
+# Old optional shared secret, handed to anyone who asks the OTA endpoint, so it protects nothing on your
+# network. Use DEVICE_KEY (below) instead; AUTH_TOKEN is only checked when DEVICE_KEY isn't set.
 AUTH_TOKEN = _env("AUTH_TOKEN", "")
 
 # --- Assistant personality -----------------------------------------------------
@@ -102,5 +102,11 @@ LIBRARY_VOICE_NOTES = _env("LIBRARY_VOICE_NOTES", "true").lower() in ("1", "true
 KEEP_PRIVATE_LOCAL = _env("KEEP_PRIVATE_LOCAL", "true").lower() in ("1", "true", "yes", "on")
 # Optional password for the web pages (lists, notes, library, Wi-Fi). User name: jarvis
 WEB_PASSWORD = _env("WEB_PASSWORD", "")
+# Other names you open the web pages by (comma-separated; ".example.com" allows a whole domain).
+# Local names (raspi5.local, raspi5) and IP addresses always work.
+ALLOWED_HOSTS = [h.strip().lower() for h in _env("ALLOWED_HOSTS", "").split(",") if h.strip()]
+# A secret built into the board's firmware by flash-esp32.sh (which also writes it here). When set, only a
+# board flashed with it can connect, wake on alarms or send gestures. Empty = the older, open behaviour.
+DEVICE_KEY = _env("DEVICE_KEY", "")
 
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")

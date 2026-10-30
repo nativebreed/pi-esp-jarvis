@@ -16,6 +16,9 @@ from urllib.parse import quote
 from typing import Callable, Optional
 
 from aiohttp import web
+import logging
+
+log = logging.getLogger("web")
 
 from .notes import ID_RE, Note, NoteStore, Transcriber, decode_pcm16
 from .store import Store
@@ -265,25 +268,91 @@ def _memory_section(mems: list[dict]) -> str:
 PROTECTED = ("/lists", "/notes", "/library", "/wifi", "/memory")
 
 
+_SAFE_SUFFIXES = (".local", ".lan", ".home", ".home.arpa", ".internal", ".localdomain")
+
+
+def host_ok(host: str) -> bool:
+    """Is this a name or address the Pi is really reached by on your network?
+
+    Blocks DNS rebinding: a web page somewhere on the internet pointing its own domain at the Pi's address,
+    which would let it read your pages from your browser. Local names (raspi5.local, raspi5), IP addresses and
+    ALLOWED_HOSTS are fine; public domain names aren't."""
+    import ipaddress
+    import socket
+    from . import config
+    host = (host or "").strip().lower()
+    if host.startswith("["):                       # [ipv6]:port
+        host = host[1:].split("]", 1)[0]
+    elif host.count(":") == 1:
+        host = host.split(":", 1)[0]
+    host = host.rstrip(".")
+    if not host:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return True
+    except ValueError:
+        pass
+    if host == "localhost" or "." not in host or host.endswith(_SAFE_SUFFIXES):
+        return True
+    if host in {socket.gethostname().lower(), socket.getfqdn().lower()}:
+        return True
+    for allowed in config.ALLOWED_HOSTS:
+        if host == allowed or (allowed.startswith(".") and host.endswith(allowed)):
+            return True
+    return False
+
+
+def same_site(request: web.Request) -> bool:
+    """A change (POST) must come from these pages, not from a form on some other website."""
+    from urllib.parse import urlsplit
+    fetch_site = request.headers.get("Sec-Fetch-Site", "")
+    if fetch_site:
+        return fetch_site in ("same-origin", "none")
+    source = request.headers.get("Origin") or request.headers.get("Referer") or ""
+    if not source:
+        return True            # not a browser (curl, scripts on the Pi): nothing to forge
+    if source == "null":
+        return False
+    return urlsplit(source).netloc.lower() == (request.host or "").lower()
+
+
 @web.middleware
-async def password_middleware(request: web.Request, handler):
-    """WEB_PASSWORD set: the web pages ask for it (user name jarvis). The board's own endpoints are unaffected."""
+async def web_guard(request: web.Request, handler):
+    """Protects the web pages (lists, notes, library, Wi-Fi). The board's own endpoints are checked in main.py.
+    * only answered under the Pi's own name or address (no DNS rebinding)
+    * changes only from these pages (no cross-site form posts)
+    * WEB_PASSWORD set: asks for it (user name jarvis)"""
     from . import config
     path = request.path
-    if config.WEB_PASSWORD and (path == "/" or path.startswith(PROTECTED)):
-        import base64
-        import secrets
-        ok = False
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Basic "):
-            try:
-                _user, _, pw = base64.b64decode(auth[6:]).decode("utf-8", "replace").partition(":")
-                ok = secrets.compare_digest(pw.encode(), config.WEB_PASSWORD.encode())
-            except Exception:
-                ok = False
-        if not ok:
-            raise web.HTTPUnauthorized(headers={"WWW-Authenticate": 'Basic realm="Jarvis", charset="UTF-8"'})
+    if path == "/" or path.startswith(PROTECTED):
+        if not host_ok(request.host):
+            log.warning("Refused a web request for host %r from %s (not a local name; see ALLOWED_HOSTS)",
+                        request.host, request.remote)
+            return web.Response(status=403, text=(
+                f"Jarvis doesn't answer to the name '{request.host}'. Use the Pi's own address, e.g. "
+                "http://raspi5.local:8000, or add the name to ALLOWED_HOSTS in the .env file."))
+        if request.method not in ("GET", "HEAD", "OPTIONS") and not same_site(request):
+            log.warning("Refused a cross-site %s %s from %s (Origin %r)", request.method, path, request.remote,
+                        request.headers.get("Origin"))
+            return web.Response(status=403, text="That change came from another website, so Jarvis ignored it.")
+        if config.WEB_PASSWORD:
+            import base64
+            import secrets
+            ok = False
+            auth = request.headers.get("Authorization", "")
+            if auth.startswith("Basic "):
+                try:
+                    _user, _, pw = base64.b64decode(auth[6:]).decode("utf-8", "replace").partition(":")
+                    ok = secrets.compare_digest(pw.encode(), config.WEB_PASSWORD.encode())
+                except Exception:
+                    ok = False
+            if not ok:
+                raise web.HTTPUnauthorized(headers={"WWW-Authenticate": 'Basic realm="Jarvis", charset="UTF-8"'})
     return await handler(request)
+
+
+password_middleware = web_guard   # old name
 
 
 def add_routes(app: web.Application, store: Store, on_wifi: Optional[Callable[[], None]] = None,

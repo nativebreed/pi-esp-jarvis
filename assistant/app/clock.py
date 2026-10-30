@@ -207,6 +207,15 @@ class Clock:
         return None
 
     @staticmethod
+    def _half_day_unsaid(text: str, low: str, now: dt.datetime) -> bool:
+        """True when the time said could be either AM or PM ("7:30", "half past 7"), but not when it says
+        which ("7:30 pm", "this morning", "noon") or is a 24-hour time ("19:30", "00:15")."""
+        if re.search(r"\b(am|pm|a\.m\.?|p\.m\.?|morning|evening|afternoon|tonight|night)\b", low):
+            return False
+        am, pm = parse_clock(text + " in the morning", now), parse_clock(text + " in the evening", now)
+        return bool(am and pm) and am[0].hour != pm[0].hour
+
+    @staticmethod
     def _timer_name(t: dict) -> str:
         if t.get("label"):
             return f"{t['label']} timer"
@@ -232,6 +241,11 @@ class Clock:
             if parsed:
                 hm = parsed[0].strftime("%H:%M")
                 gone = [a for a in alarms if a["time"] == hm]
+                if not gone and self._half_day_unsaid(text, low, now):
+                    # "turn off my 7:30 alarm" at 8:00: the parser guessed 19:30 (the next 7:30), but the
+                    # alarm is the morning one. Try the other half of the day.
+                    other = (parsed[0] + dt.timedelta(hours=12)).strftime("%H:%M")
+                    gone = [a for a in alarms if a["time"] == other]
             elif re.search(r"\b(all|every)\b", low) or len(alarms) <= 1:
                 gone = alarms
             else:

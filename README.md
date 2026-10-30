@@ -93,6 +93,9 @@ bash flash-esp32.sh v2     # board revision 2
 The first time, this builds the firmware on your Pi (about 20–30 minutes), then flashes it. Later runs are quick.
 Not sure which revision you have? Try v1; if the screen stays black, run it again with `v2`.
 
+It also makes a **device key**, a secret saved in `.env` as `DEVICE_KEY` and built into the firmware, so the Pi only talks to
+your board. Run `docker compose up -d --build` afterwards so the Pi expects it.
+
 ### Step 4 · Connect the board to your Wi-Fi
 
 1. The board creates a Wi-Fi network called **Xiaozhi-XXXX**. Join it from your phone.
@@ -345,6 +348,8 @@ Everything lives in the `.env` file. After editing it, run `docker compose up -d
 | `LIBRARY_MIN_SCORE` | `0.60` | How close a match must be before Jarvis uses your files unasked (see the scores on the Library page) |
 | `KEEP_PRIVATE_LOCAL` | `true` | Memories and voice-note transcripts also never go to Claude |
 | `WEB_PASSWORD` | – | Password for the web pages (user name `jarvis`) |
+| `ALLOWED_HOSTS` | – | Other names you open the web pages by, e.g. `jarvis.example.com` (local names and IP addresses always work) |
+| `DEVICE_KEY` | made by `flash-esp32.sh` | The board's secret; change it only by reflashing |
 | `NOTES_SILENCE_STOP_S` | `120` | Stop recording after this many seconds of quiet |
 | `NOTES_MAX_MINUTES` | `30` | Longest single note |
 
@@ -354,6 +359,17 @@ Everything lives in the `.env` file. After editing it, run `docker compose up -d
 
 **Change the face:** the animations are GIFs in [`firmware/face/emoji/`](firmware/face/emoji), one per mood, 240 × 240 px.
 Replace them with your own (same file names) or tweak [`character.py`](firmware/face/character.py), then run the flash script again.
+
+## Security on your network
+
+* **The board.** With `DEVICE_KEY` set (the flash script does it), the Pi only accepts the voice connection, alarm
+  wake-ups and gestures from a board flashed with that key, and gestures only from the board's own address. The key is
+  never sent out by the Pi; it's built into the firmware.
+* **The web pages** only answer under the Pi's own name or address (so a website you visit can't point its own domain
+  at your Pi and read your pages), and only accept changes made on the pages themselves (a form on another website
+  can't add a Wi-Fi network or delete files). Anyone on your Wi-Fi can still open them, so set `WEB_PASSWORD`.
+  Opening them by another name, like a custom domain? Add it to `ALLOWED_HOSTS`.
+* Port 8000 has to stay open on your home network for the board. Don't forward it to the internet.
 
 ## Costs
 
@@ -384,6 +400,10 @@ you can set a monthly spending limit in the Claude Console. Without an API key i
   match is just under `LIBRARY_MIN_SCORE`, lower it a little (e.g. `0.55`), or start with "check my files for…".
   If it uses them when it shouldn't, raise it.
 * **A file says "couldn't read".** Password-protected PDFs and damaged files can't be read; scanned PDFs are read up to 20 pages.
+* **After updating, the board can't connect ("unauthorized" in the log).** The Pi has a `DEVICE_KEY` the board doesn't:
+  run `bash flash-esp32.sh v2` again, then `docker compose up -d --build`.
+* **"Jarvis doesn't answer to the name …" on a web page.** Use `http://raspi5.local:8000` or the Pi's IP address, or add
+  the name you use to `ALLOWED_HOSTS` in `.env`.
 * **The wake word rarely triggers.** Speak from about 1 m away, or rebuild with `WAKE_WORD=hiesp REBUILD=1 bash flash-esp32.sh`.
 
 ## What's in the box

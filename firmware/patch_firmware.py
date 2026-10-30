@@ -15,6 +15,10 @@ import sys
 from pathlib import Path
 
 board, ota_url = sys.argv[1], sys.argv[2]
+# The device key (flash-esp32.sh keeps it in .env as DEVICE_KEY): the Pi only lets in a board that sends it.
+device_key = os.environ.get("DEVICE_KEY", "").strip()
+if device_key and not re.fullmatch(r"[A-Za-z0-9_-]{16,128}", device_key):
+    sys.exit("patch_firmware: DEVICE_KEY must be 16-128 letters, digits, - or _")
 emoji_dir = Path(sys.argv[3]) if len(sys.argv) > 3 else None
 root = Path(".")
 board_dir = root / "main" / "boards" / "waveshare" / board
@@ -186,6 +190,7 @@ AGENT_CODE = r"""
             bool ok = false;
             {
                 auto http = self->GetNetwork()->CreateHttp(0);
+                JV_KEY_HEADER(http);
                 http->SetTimeout(35000);
                 if (http->Open("GET", url)) {
                     auto code = http->GetStatusCode();
@@ -265,6 +270,7 @@ AGENT_CODE = r"""
                 {
                     std::unique_ptr<std::string> kind(static_cast<std::string*>(p));
                     auto http = Board::GetInstance().GetNetwork()->CreateHttp(0);
+                    JV_KEY_HEADER(http);
                     http->SetHeader("Content-Type", "application/json");
                     http->SetContent("{\"device\":\"" + SystemInfo::GetMacAddress() + "\",\"type\":\"" + *kind + "\"}");
                     if (http->Open("POST", ServerBase() + "gesture")) {
@@ -786,6 +792,7 @@ AGENT_CODE = r"""
             std::string body;
             {
                 auto http = self->GetNetwork()->CreateHttp(0);
+                JV_KEY_HEADER(http);
                 http->SetTimeout(5000);
                 if (http->Open("GET", job->url)) {
                     auto code = http->GetStatusCode();
@@ -1623,7 +1630,18 @@ if "InitializeAgentExtras" not in text:
                  f"#define JV_FLIP_OFFSET_X {flip_x}\n#define JV_FLIP_OFFSET_Y {flip_y}\n"
                  f"#define JV_UP_AXIS {up_axis}\n#define JV_UP_SIGN {up_sign}\n"
                  "#ifdef BUILTIN_TEXT_FONT\nLV_FONT_DECLARE(BUILTIN_TEXT_FONT);\n#define JV_TEXT_FONT (&BUILTIN_TEXT_FONT)\n"
-                 "#else\n#define JV_TEXT_FONT LV_FONT_DEFAULT\n#endif")
+                 "#else\n#define JV_TEXT_FONT LV_FONT_DEFAULT\n#endif\n"
+                 + (f'#define JV_KEY_HEADER(h) (h)->SetHeader("X-Jarvis-Key", "{device_key}")' if device_key
+                    else "#define JV_KEY_HEADER(h) ((void)0)"))
     text = text.replace("#include <lvgl.h>", "#include <lvgl.h>\n" + extra_inc, 1)
     src.write_text(text, encoding="utf-8")
 print("patched: double-tap, wake channel, gestures, upright screen, dice, timer and voice-notes screens")
+
+# --- 5. device key on the voice connection ------------------------------------------------
+if device_key:
+    ws_src = root / "main" / "protocols" / "websocket_protocol.cc"
+    line = '    websocket_->SetHeader("Device-Id", SystemInfo::GetMacAddress().c_str());\n'
+    patch(ws_src, line, line + f'    websocket_->SetHeader("X-Jarvis-Key", "{device_key}");  // Pi-Esp Jarvis\n')
+    print("patched: device key (the Pi only accepts this board)")
+else:
+    print("note: no DEVICE_KEY, so the Pi can't tell this board from other clients (flash-esp32.sh makes one)")

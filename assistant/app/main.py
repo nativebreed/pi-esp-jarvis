@@ -53,6 +53,7 @@ FRAME_BYTES = SPEAKER_RATE * FRAME_MS // 1000 * 2  # 60 ms of 16-bit mono
 SESSIONS: dict[str, "Session"] = {}          # device id -> open conversation
 PENDING: list[Alert] = []                     # alerts waiting to be rung
 WAITERS: dict[str, asyncio.Future] = {}       # device id -> parked long-poll
+DEVICE_IPS: dict[str, str] = {}               # device id -> address it last connected from
 
 
 def on_alert(alert: Alert) -> None:
@@ -163,6 +164,7 @@ class Session:
         self.dice_until = 0.0
         self.cam_screen: str | None = None        # "photo" / "live" while the camera is on the board's screen
         self.cam_screen_until = 0.0
+        self.remote = ""                          # the board's network address (gestures must come from it)
         self.notes = Recorder(self, NOTES, TRANSCRIBER)
 
     # ---------------------------------------------------------------- sending
@@ -1184,8 +1186,20 @@ class Session:
                     return
 
 
+def device_key_ok(request: web.Request) -> bool:
+    """With DEVICE_KEY set, only a board flashed with it gets in (the key is never handed out over the network)."""
+    if not config.DEVICE_KEY:
+        return True
+    return secrets.compare_digest(request.headers.get("X-Jarvis-Key", "").encode(), config.DEVICE_KEY.encode())
+
+
 async def websocket(request: web.Request) -> web.WebSocketResponse:
-    if config.AUTH_TOKEN:
+    if config.DEVICE_KEY:
+        if not device_key_ok(request):
+            log.warning("Refused a connection from %s without the device key (reflash the board with "
+                        "flash-esp32.sh if this is Jarvis)", request.remote)
+            raise web.HTTPUnauthorized()
+    elif config.AUTH_TOKEN:
         token = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
         if token != config.AUTH_TOKEN:
             raise web.HTTPUnauthorized()
@@ -1193,6 +1207,8 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
     await ws.prepare(request)
     device_id = request.headers.get("Device-Id", request.remote or "unknown")
     session = Session(ws, device_id)
+    session.remote = request.remote or ""
+    DEVICE_IPS[device_id] = session.remote
     old = SESSIONS.get(device_id)
     SESSIONS[device_id] = session
     if old and not old.ws.closed:
@@ -1216,6 +1232,13 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
             await session.notes.disconnected()
         except Exception:
             log.exception("[%s] could not save the voice note", device_id)
+        alert, session.alert_waiting = session.alert_waiting, None
+        if alert is not None and alert.kind == "alarm":
+            # Paused with a tap and never answered ("stop" / "snooze"): treat it like an alarm that rang out,
+            # so a sleepy tap doesn't lose the wake-up. The auto-snooze limit stops it coming back forever.
+            snoozed = CLOCK.snooze(alert, auto=True)
+            log.info("[%s] paused alarm never answered: %s", device_id,
+                     "snoozed" if snoozed else "not snoozed (auto-snooze limit reached)")
         log.info("[%s] disconnected", device_id)
         if PENDING:
             deliver_alerts()
@@ -1227,6 +1250,8 @@ async def websocket(request: web.Request) -> web.WebSocketResponse:
 # =============================================================================
 async def events(request: web.Request) -> web.Response:
     """The idle device parks a request here; we answer 'wake' when an alert is due."""
+    if not device_key_ok(request):
+        raise web.HTTPUnauthorized()   # otherwise anyone could park here and swallow the board's alarm wake-ups
     device = request.query.get("device", "unknown")
     if PENDING and device not in SESSIONS:
         return web.json_response({"event": "wake"})
@@ -1254,6 +1279,13 @@ async def gesture(request: web.Request) -> web.Response:
         body = {}
     device, kind = body.get("device", "unknown"), body.get("type", "")
     session = SESSIONS.get(device)
+    if not device_key_ok(request):
+        raise web.HTTPUnauthorized()
+    # A gesture only counts from the board itself: the address of its live connection, or the one it last used.
+    expected = session.remote if session else DEVICE_IPS.get(device)
+    if expected and request.remote != expected:
+        log.warning("[%s] ignored a %s gesture from %s (the board is at %s)", device, kind, request.remote, expected)
+        raise web.HTTPForbidden()
     if session:
         await session.on_gesture(kind)
     elif kind == "shake":
@@ -1331,7 +1363,7 @@ def wifi_added() -> None:
 
 
 def make_app() -> web.Application:
-    app = web.Application(middlewares=[web_ui.password_middleware])
+    app = web.Application(middlewares=[web_ui.web_guard])
     app.router.add_route("*", "/xiaozhi/ota/", ota)
     app.router.add_route("*", "/xiaozhi/ota", ota)
     app.router.add_get("/xiaozhi/v1/", websocket)

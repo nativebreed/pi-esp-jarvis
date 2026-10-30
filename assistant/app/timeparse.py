@@ -120,7 +120,14 @@ def parse_clock(text: str, now: dt.datetime) -> tuple[dt.datetime, str] | None:
         target += dt.timedelta(days=1)
     if repeat != "once":
         target = next_repeat(target - dt.timedelta(seconds=1), repeat, target.hour, target.minute)
-    return target, repeat
+    return _wall(target), repeat
+
+
+def _wall(d: dt.datetime) -> dt.datetime:
+    """The same wall-clock time, with the UTC offset in force on that date (so 7:00 stays 7:00 across a clock
+    change). Arithmetic on a datetime from astimezone() keeps the old fixed offset, which is an hour out once
+    the clocks have gone forward or back."""
+    return d.replace(tzinfo=None).astimezone()
 
 
 def next_repeat(after: dt.datetime, repeat: str, hour: int, minute: int) -> dt.datetime:
@@ -131,9 +138,9 @@ def next_repeat(after: dt.datetime, repeat: str, hour: int, minute: int) -> dt.d
     for _ in range(8):
         wd = cand.weekday()
         if repeat in ("once", "daily") or (repeat == "weekdays" and wd < 5) or (repeat == "weekends" and wd >= 5):
-            return cand
+            return _wall(cand)
         cand += dt.timedelta(days=1)
-    return cand
+    return _wall(cand)
 
 
 # ---------------------------------------------------------------------------
