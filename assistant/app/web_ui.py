@@ -53,7 +53,7 @@ PAGE = """<!doctype html>
 </style></head>
 <body><main>
 <h1><span>●</span> Jarvis</h1>
-<nav><a class="on" href="/lists">Lists</a><a href="/notes">Voice notes</a><a href="/wifi">Wi-Fi</a></nav>
+<nav><a class="on" href="/lists">Lists</a><a href="/notes">Voice notes</a><a href="/library">Library</a><a href="/wifi">Wi-Fi</a></nav>
 {sections}
 <section>
   <h2>New list</h2>
@@ -94,7 +94,7 @@ WIFI_PAGE = """<!doctype html>
 </style></head>
 <body><main>
 <h1><span>●</span> Jarvis</h1>
-<nav><a href="/lists">Lists</a><a href="/notes">Voice notes</a><a class="on" href="/wifi">Wi-Fi</a></nav>
+<nav><a href="/lists">Lists</a><a href="/notes">Voice notes</a><a href="/library">Library</a><a class="on" href="/wifi">Wi-Fi</a></nav>
 {notice}
 <section>
   <h2>Add a Wi-Fi network</h2>
@@ -155,7 +155,7 @@ NOTES_PAGE = """<!doctype html>
 </style></head>
 <body><main>
 <h1><span>●</span> Jarvis</h1>
-<nav><a href="/lists">Lists</a><a class="on" href="/notes">Voice notes</a><a href="/wifi">Wi-Fi</a></nav>
+<nav><a href="/lists">Lists</a><a class="on" href="/notes">Voice notes</a><a href="/library">Library</a><a href="/wifi">Wi-Fi</a></nav>
 <form class="search" method="get" action="/notes"><input name="q" value="{q}" placeholder="Search what you said…">
 <button>Search</button></form>
 {summary}
@@ -260,6 +260,30 @@ def _memory_section(mems: list[dict]) -> str:
     return (f'<section><h2>Things Jarvis remembers</h2><ul>{rows}</ul>'
             f'<form class="add" method="post" action="/memory/add"><input name="text" placeholder="Something to remember…" required>'
             f'<button>Add</button></form></section>')
+
+
+PROTECTED = ("/lists", "/notes", "/library", "/wifi", "/memory")
+
+
+@web.middleware
+async def password_middleware(request: web.Request, handler):
+    """WEB_PASSWORD set: the web pages ask for it (user name jarvis). The board's own endpoints are unaffected."""
+    from . import config
+    path = request.path
+    if config.WEB_PASSWORD and (path == "/" or path.startswith(PROTECTED)):
+        import base64
+        import secrets
+        ok = False
+        auth = request.headers.get("Authorization", "")
+        if auth.startswith("Basic "):
+            try:
+                _user, _, pw = base64.b64decode(auth[6:]).decode("utf-8", "replace").partition(":")
+                ok = secrets.compare_digest(pw.encode(), config.WEB_PASSWORD.encode())
+            except Exception:
+                ok = False
+        if not ok:
+            raise web.HTTPUnauthorized(headers={"WWW-Authenticate": 'Basic realm="Jarvis", charset="UTF-8"'})
+    return await handler(request)
 
 
 def add_routes(app: web.Application, store: Store, on_wifi: Optional[Callable[[], None]] = None,

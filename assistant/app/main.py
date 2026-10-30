@@ -7,6 +7,7 @@ HTTP  GET /xiaozhi/events      -> long-poll: the device waits here to be woken (
 HTTP  POST /xiaozhi/gesture    -> motion gestures from the device while it is idle
 HTTP  GET /lists               -> shopping / to-do lists and memories in a browser
 HTTP  GET /notes               -> voice notes: play, read, download, delete
+HTTP  GET /library             -> your private library and databases (answered on the Pi only)
 """
 from __future__ import annotations
 
@@ -21,11 +22,12 @@ import uuid
 
 from aiohttp import WSMsgType, web
 
-from . import camera, config, music, notes, screen, sounds, web_ui
+from . import camera, config, dbs, library, music, notes, privacy, screen, sounds, web_ui
 from .brain import Brain, Conversation, is_goodbye, match_claude_trigger, sentences
 from .clock import Alert, Clock
 from .pihelper import PiHelper
 from .recorder import Recorder
+from . import library_web
 from .reply import Reply
 from .skills import _YES, Skills
 from .store import Store
@@ -74,6 +76,8 @@ def deliver_alerts() -> None:
 STORE = Store()
 NOTES = notes.NoteStore()
 TRANSCRIBER = notes.Transcriber(NOTES, STT, BRAIN)
+LIBRARY = library.Library(STT, BRAIN._http)
+DBS = dbs.Databases()
 CLOCK = Clock(STORE, on_alert)
 WEATHER = Weather()
 HELPER = PiHelper()
@@ -363,11 +367,31 @@ class Session:
                 await self.handle_music(command)
                 return
 
+            # --- your private library and databases: answered on the Pi, never by Claude
+            asked = library.explicit_query(text)
+            if asked is not None:
+                await self.answer_from_library(asked, asked=True)
+                return
+            found = DBS.match(text)
+            if found:
+                await self.answer_from_database(*found, heard=text)
+                return
+
             question = match_claude_trigger(text)
             if question is None and not self.next_goes_to_claude:
                 reply = await SKILLS.handle(text)
                 if reply:
                     await self.deliver(reply, text)
+                    return
+
+            claude_asked = question is not None or self.next_goes_to_claude
+            if question != "":   # does this need your own files? (stays on the Pi if so)
+                q = question or text
+                hits = await self.library_hits(q, config.LIBRARY_CLAUDE_SCORE if claude_asked
+                                               else config.LIBRARY_MIN_SCORE)
+                if hits:
+                    self.next_goes_to_claude = False
+                    await self.answer_from_library(q, hits=hits, claude_asked=claude_asked)
                     return
 
             use_claude = question is not None or self.next_goes_to_claude
@@ -403,12 +427,22 @@ class Session:
 
     async def answer(self, question: str, use_claude: bool, extra: str = "",
                      filler: str | None = None,
-                     images: list[tuple[str, bytes]] | None = None) -> None:
-        self.conv.add("user", question)
-        extra = "\n\n".join(p for p in (SKILLS.memory_prompt(), extra) if p)
+                     images: list[tuple[str, bytes]] | None = None, private: bool = False) -> None:
+        """private=True: the prompt holds your library, database results or memories: local model only,
+        and the turn is kept out of anything later sent to Claude."""
+        if private:
+            use_claude = False
         if use_claude and not BRAIN.claude_available:
             await self.speak("Claude isn't set up yet, so here is my own answer.")
             use_claude = False
+        memories = SKILLS.memory_prompt()
+        if memories and config.KEEP_PRIVATE_LOCAL:
+            if use_claude:
+                memories = ""                    # your memories stay on the Pi
+            else:
+                memories, private = privacy.mark(memories), True
+        extra = "\n\n".join(p for p in (memories, extra) if p)
+        self.conv.add("user", question, private=private)
 
         if use_claude:
             log.info("[%s] -> Claude (%s): %s", self.device_id, config.CLAUDE_MODEL, question)
@@ -462,9 +496,69 @@ class Session:
             producer.cancel()
         reply = " ".join(reply_parts).strip()
         if reply:
-            self.conv.add("assistant", reply)
+            self.conv.add("assistant", reply, private=private)
         else:
             self.conv.messages.pop()  # drop the unanswered question
+
+    # ------------------------------------------------------------- private library and databases
+    async def library_hits(self, query: str, threshold: float) -> list:
+        if not config.LIBRARY_ENABLED or LIBRARY.empty():
+            return []
+        try:
+            hits = await LIBRARY.search(query)
+        except Exception as exc:
+            log.warning("[%s] library search failed: %s", self.device_id, exc)
+            return []
+        if hits:
+            log.info("[%s] library: best match %.2f (%s), needs %.2f", self.device_id, hits[0].score,
+                     hits[0].name, threshold)
+        good = [h for h in hits if h.score >= threshold - 0.12]
+        return good if hits and hits[0].score >= threshold else []
+
+    async def answer_from_library(self, question: str, hits: list | None = None, asked: bool = False,
+                                  claude_asked: bool = False) -> None:
+        await self.send_json(type="llm", emotion="thinking", text="🤔")
+        await self.send_json(type="tts", state="start")
+        if hits is None:
+            if not config.LIBRARY_ENABLED or LIBRARY.empty():
+                await self.speak("Your library is empty. Put files in the library folder on the Pi, "
+                                 "and I'll read them.")
+                hits = []
+            else:
+                hits = await self.library_hits(question, config.LIBRARY_ASKED_SCORE)
+                if not hits:
+                    await self.speak("I couldn't find anything about that in your files.")
+        if hits:
+            log.info("[%s] -> local, from the library (%s)", self.device_id,
+                     ", ".join(sorted({h.name for h in hits})))
+            if claude_asked:
+                await self.speak("That's in your private files, so I'll answer here on the Pi.")
+            await self.answer(question, use_claude=False, extra=LIBRARY.context(hits), private=True,
+                              filler="" if claude_asked else "Let me check your files.")
+        await self.send_json(type="tts", state="stop")
+        self.conv.last_used = time.monotonic()
+        self.start_listening()
+
+    async def answer_from_database(self, conn, q, params: dict, heard: str) -> None:
+        log.info("[%s] -> database %s: %r %s", self.device_id, conn.name, q.phrase, params or "")
+        await self.send_json(type="llm", emotion="thinking", text="🤔")
+        await self.send_json(type="tts", state="start")
+        job = asyncio.create_task(asyncio.to_thread(dbs.run_query, conn, q.sql, params))
+        await self.speak("Let me check.")
+        try:
+            cols, rows = await job
+        except Exception as exc:
+            log.warning("[%s] database %s failed: %s", self.device_id, conn.name, exc)
+            await self.speak(f"Sorry, I couldn't get an answer from {conn.name}. "
+                             "The Library page on the Pi shows what went wrong.")
+            DBS.last_error[q.id] = str(exc)
+        else:
+            DBS.last_error.pop(q.id, None)
+            await self.answer(heard, use_claude=False, extra=dbs.Databases.context(conn, q, cols, rows, heard),
+                              private=True, filler="")
+        await self.send_json(type="tts", state="stop")
+        self.conv.last_used = time.monotonic()
+        self.start_listening()
 
     # ------------------------------------------------------------- skill replies
     async def deliver(self, reply: Reply, heard: str) -> None:
@@ -1187,10 +1281,16 @@ async def on_startup(app: web.Application) -> None:
                  asyncio.create_task(CLOCK.run()),
                  asyncio.create_task(WEATHER.home()),
                  asyncio.create_task(TRANSCRIBER.run())]
+    if config.LIBRARY_ENABLED:
+        app["bg"].append(asyncio.create_task(LIBRARY.run(BRAIN.pull_model, BRAIN.local_ready)))
+        log.info("Library: %s (answered on the Pi only, never sent to Claude); %d database connection(s)",
+                 LIBRARY.dir, len(DBS.conns))
+    log.info("Privacy: memories and voice notes %s", "stay on the Pi" if config.KEEP_PRIVATE_LOCAL
+             else "may be sent to Claude (KEEP_PRIVATE_LOCAL=false)")
     try:
         NOTES.ensure()
         log.info("Voice notes: %s (%d so far, Claude tidy-up %s)", NOTES.dir, len(NOTES.ids()),
-                 "on" if config.NOTES_CLAUDE and BRAIN.claude_available else "off")
+                 "on" if config.NOTES_CLAUDE and not config.KEEP_PRIVATE_LOCAL and BRAIN.claude_available else "off")
     except OSError as exc:
         log.error("Voice notes folder %s isn't usable: %s", NOTES.dir, exc)
     log.info("Claude: %s", f"enabled ({config.CLAUDE_MODEL})" if BRAIN.claude_available
@@ -1231,7 +1331,7 @@ def wifi_added() -> None:
 
 
 def make_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[web_ui.password_middleware])
     app.router.add_route("*", "/xiaozhi/ota/", ota)
     app.router.add_route("*", "/xiaozhi/ota", ota)
     app.router.add_get("/xiaozhi/v1/", websocket)
@@ -1242,6 +1342,7 @@ def make_app() -> web.Application:
     app.router.add_get("/xiaozhi/camera/photo.jpg", camera_photo_http)
     app.router.add_get("/xiaozhi/camera/live.jpg", camera_live_http)
     web_ui.add_routes(app, STORE, on_wifi=wifi_added, notes=NOTES, transcriber=TRANSCRIBER)
+    library_web.add_routes(app, LIBRARY, DBS)
     app.on_startup.append(on_startup)
     return app
 

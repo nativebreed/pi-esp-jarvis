@@ -7,6 +7,7 @@ ENV PYTHONUNBUFFERED=1 \
 
 RUN apt-get update \
  && apt-get install -y --no-install-recommends libopus0 ffmpeg v4l-utils ca-certificates tzdata \
+    tesseract-ocr tesseract-ocr-eng poppler-utils \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /srv

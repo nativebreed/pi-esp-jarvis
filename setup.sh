@@ -75,7 +75,7 @@ if [ ! -f .env ]; then
 else
   note "Keeping your existing .env settings."
 fi
-mkdir -p music voice-notes
+mkdir -p music voice-notes library
 
 # ------------------------------------------------------------------ camera
 CAM="$(ls /dev/v4l/by-id/*-video-index0 2>/dev/null | head -n1 || true)"

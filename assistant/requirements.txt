@@ -7,3 +7,9 @@ piper-tts==1.8.0
 webrtcvad-wheels==2.0.14.post1
 opuslib==3.0.1
 mutagen==1.48.1
+pypdf==6.21.4
+python-docx==1.2.0
+openpyxl==3.1.5
+python-pptx==1.0.2
+PyMySQL==1.2.3
+pg8000==1.31.6

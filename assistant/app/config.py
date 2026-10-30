@@ -84,4 +84,23 @@ NOTES_SILENCE_STOP_S = _env_float("NOTES_SILENCE_STOP_S", 120)  # stop recording
 NOTES_MAX_MINUTES = _env_float("NOTES_MAX_MINUTES", 30)         # longest single note
 NOTES_IDLE_CLOSE_S = _env_float("NOTES_IDLE_CLOSE_S", 600)      # close the recorder when left alone
 
+# --- Private library (answered by the local model only, never sent to Claude) ----------------
+LIBRARY_ENABLED = _env("LIBRARY_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+LIBRARY_DIR = Path(_env("LIBRARY_DIR", str(DATA_DIR / "library-files")))   # docker-compose maps ./library here
+LIBRARY_EMBED_MODEL = _env("LIBRARY_EMBED_MODEL", "nomic-embed-text")      # finds passages (Ollama, on the Pi)
+LIBRARY_VISION_MODEL = _env("LIBRARY_VISION_MODEL", "moondream")           # describes pictures; "off" = don't
+if LIBRARY_VISION_MODEL.lower() in ("off", "none", "false", "no"):
+    LIBRARY_VISION_MODEL = ""
+LIBRARY_MIN_SCORE = _env_float("LIBRARY_MIN_SCORE", 0.60)        # how close a passage must be to answer by itself
+LIBRARY_ASKED_SCORE = _env_float("LIBRARY_ASKED_SCORE", 0.40)    # ... when you said "check my files"
+LIBRARY_CLAUDE_SCORE = _env_float("LIBRARY_CLAUDE_SCORE", 0.68)  # "use Claude" questions this close stay on the Pi
+LIBRARY_SCAN_S = _env_float("LIBRARY_SCAN_S", 60)                # look for new or changed files this often
+LIBRARY_MAX_MB = _env_float("LIBRARY_MAX_MB", 50)                # skip files bigger than this
+LIBRARY_OCR_PAGES = int(_env("LIBRARY_OCR_PAGES", "20"))         # pages of a scanned PDF to read
+LIBRARY_VOICE_NOTES = _env("LIBRARY_VOICE_NOTES", "true").lower() in ("1", "true", "yes", "on")
+# true = memories and voice-note transcripts never go to Claude either (the library never does, whatever this says)
+KEEP_PRIVATE_LOCAL = _env("KEEP_PRIVATE_LOCAL", "true").lower() in ("1", "true", "yes", "on")
+# Optional password for the web pages (lists, notes, library, Wi-Fi). User name: jarvis
+WEB_PASSWORD = _env("WEB_PASSWORD", "")
+
 LOG_LEVEL = _env("LOG_LEVEL", "INFO")

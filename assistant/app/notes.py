@@ -362,7 +362,7 @@ class Transcriber:
             return
         note.status = "done" if text else "empty"
         note.title = plain_title(text)
-        if text and config.NOTES_CLAUDE and self.brain.claude_available:
+        if text and config.NOTES_CLAUDE and not config.KEEP_PRIVATE_LOCAL and self.brain.claude_available:
             title, tidy = await self.tidy(text)
             note.title = title or note.title
             note.tidy = tidy

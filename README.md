@@ -251,13 +251,51 @@ a level meter, the time, and the note's date. Swipe (or tap ‹ ›) for older a
 
 Recording stops by itself after 2 minutes of quiet or 30 minutes in all. Each note is saved on the Pi in the **`voice-notes`**
 folder, named by when you recorded it: `20261028143205.ogg`, with `20261028143205.txt` beside it, written by Whisper on the Pi a
-few seconds after you stop. With `NOTES_CLAUDE=true`, Claude also tidies the transcript (punctuation, paragraphs, no "um"s)
-and gives each note a title; only the text is sent, never the audio.
+few seconds after you stop. With `NOTES_CLAUDE=true` and `KEEP_PRIVATE_LOCAL=false`, Claude also tidies the transcript
+(punctuation, paragraphs, no "um"s) and gives each note a title; only the text is sent, never the audio. By default
+transcripts stay on the Pi.
 
-Open **`http://raspi5.local:8000/notes`** (the **Voice notes** tab next to Lists and Wi-Fi) to play notes in the browser, read and
+Open **`http://raspi5.local:8000/notes`** (the **Voice notes** tab next to Lists, Library and Wi-Fi) to play notes in the browser, read and
 search the transcripts, download the audio or text, run a transcript again, or delete notes.
 
 The recorder screen needs the current firmware. On older firmware "take a note" still works by voice: talk, then stay quiet for a few seconds.
+
+### Your private library
+
+Copy documents, pictures and recordings into the **`library`** folder on the Pi (next to `music`), and Jarvis can answer
+from them. **Only the AI on the Pi ever reads them: nothing from your library or databases is sent to Claude**, even if
+you say "use Claude".
+
+| You say | What happens |
+|---|---|
+| "Check my files for the boiler warranty" | Searches your library and answers from it (or says it couldn't find anything) |
+| "What do my documents say about the lease?" | The same |
+| "When does my car insurance renew?" | Any question: if your files clearly have the answer, Jarvis uses them |
+| "Use Claude, when does my car insurance renew?" | Stays on the Pi: "That's in your private files, so I'll answer here" |
+
+**What it reads:** text and Markdown, PDF (scans too, with text recognition), Word (.docx), Excel (.xlsx), PowerPoint
+(.pptx), OpenDocument text, RTF, CSV, JSON, web pages, pictures (the text in them plus a one-line description from a small
+vision model on the Pi), sound recordings (transcribed by Whisper), and your voice notes. Save old `.doc`/`.xls`/`.ppt`
+files in the newer format. New and changed files are read within a minute; delete a file and Jarvis forgets it.
+
+**How it works:** each file is cut into short passages and indexed with `nomic-embed-text`, a small search model in Ollama
+on the Pi (downloaded the first time, about 300 MB; picture descriptions use `moondream`, about 1.7 GB). Your question finds
+the closest passages, and the local model answers from just those, so answers take a little longer than chat (10–20 s on a
+Pi 5). It's best at "what does this file say about…" and weak at "add up everything in all my invoices".
+
+**Databases.** On the Library page, add a **SQLite** or **JSON** file (from the library folder), or a **MySQL** or
+**PostgreSQL** server, then add questions: a phrase and a read-only `SELECT`, e.g. "how many orders today". A phrase can
+have a `{placeholder}`: "phone number for {name}" runs `... WHERE name LIKE '%' || :name || '%'` with whatever you said.
+Only single `SELECT` queries are accepted, they run read-only with a time limit, and passwords stay on the Pi; a database
+user that can only read is still the safest choice.
+
+**The Library page** (`http://raspi5.local:8000/library`) shows every file and whether it was read, lets you try a search and
+see the passages Jarvis would use (with their match score), and manages database connections.
+
+**Privacy rule.** Library passages, database results and your "remember that…" memories are only given to the local model.
+Turns that used them are kept out of anything later sent to Claude, and the code that calls Claude strips anything marked
+private and logs every call. With `KEEP_PRIVATE_LOCAL=false`, memories (and the voice-note tidy-up) can go to Claude again;
+the library never does. Set `WEB_PASSWORD` to put a password on the web pages (user name `jarvis`).
 
 ### Gestures
 
@@ -298,7 +336,12 @@ Everything lives in the `.env` file. After editing it, run `docker compose up -d
 | `CAMERA_DEVICE` | – | Your webcam, e.g. `/dev/video0` (needs the `COMPOSE_FILE` line above) |
 | `CAMERA_PAN_INVERT` | `false` | Set to `true` if "look left" turns the camera right |
 | `NOTES_FOLDER` | `./voice-notes` | Where voice notes are kept on the Pi |
-| `NOTES_CLAUDE` | `false` | `true` = Claude tidies each transcript and gives it a title |
+| `NOTES_CLAUDE` | `false` | `true` = Claude tidies each transcript and gives it a title (needs `KEEP_PRIVATE_LOCAL=false`) |
+| `LIBRARY_FOLDER` | `./library` | Your private library on the Pi |
+| `LIBRARY_VISION_MODEL` | `moondream` | Describes pictures; `off` saves memory |
+| `LIBRARY_MIN_SCORE` | `0.60` | How close a match must be before Jarvis uses your files unasked (see the scores on the Library page) |
+| `KEEP_PRIVATE_LOCAL` | `true` | Memories and voice-note transcripts also never go to Claude |
+| `WEB_PASSWORD` | – | Password for the web pages (user name `jarvis`) |
 | `NOTES_SILENCE_STOP_S` | `120` | Stop recording after this many seconds of quiet |
 | `NOTES_MAX_MINUTES` | `30` | Longest single note |
 
@@ -334,6 +377,10 @@ you can set a monthly spending limit in the Claude Console. Without an API key i
 * **"Go into voice notes" says the recorder screen needs the latest firmware.** Reflash the board (`bash flash-esp32.sh v2`).
 * **I can't delete notes in the `voice-notes` folder.** Docker writes them as root: delete them on the Voice notes page, or use `sudo rm`.
 * **A note plays in Chrome but not on my iPhone.** The page falls back to WAV automatically; if an old browser still won't play it, use Download audio.
+* **Jarvis doesn't use my files when I think it should.** Search for the question on the Library page: if the best
+  match is just under `LIBRARY_MIN_SCORE`, lower it a little (e.g. `0.55`), or start with "check my files for…".
+  If it uses them when it shouldn't, raise it.
+* **A file says "couldn't read".** Password-protected PDFs and damaged files can't be read; scanned PDFs are read up to 20 pages.
 * **The wake word rarely triggers.** Speak from about 1 m away, or rebuild with `WAKE_WORD=hiesp REBUILD=1 bash flash-esp32.sh`.
 
 ## What's in the box
@@ -349,6 +396,7 @@ pi-helper/             optional helper that lets Jarvis control the Pi (install.
 firmware/              firmware builder: xiaozhi-esp32 (pinned) + our patches + the Visor face
 music/                 put your own music here (optional)
 voice-notes/           your voice notes and transcripts (made on first use)
+library/               your private library: files Jarvis may read, on the Pi only
 docs/                  pictures for this README
 ```
 

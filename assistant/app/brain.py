@@ -12,9 +12,10 @@ from typing import AsyncIterator
 
 import httpx
 
-from . import config
+from . import config, privacy
 
 log = logging.getLogger("brain")
+LOCAL_CTX = 4096   # room for library passages; keep it the same everywhere so Ollama doesn't reload the model
 
 # "ask Claude ..." / "use Claude ..." — Whisper often hears "Claude" as cloud/Clyde/clawed, so accept those too.
 _CLAUDE_WORD = r"(?:claude|claud|clawed|clod|clode|cloud|clyde|klaud|klod)"
@@ -79,8 +80,12 @@ class Conversation:
     messages: list[dict] = field(default_factory=list)
     last_used: float = 0.0
 
-    def add(self, role: str, content: str) -> None:
-        self.messages.append({"role": role, "content": content})
+    def add(self, role: str, content: str, private: bool = False) -> None:
+        """private=True: this turn used your library, databases or memories, so it never goes to Claude."""
+        msg = {"role": role, "content": content}
+        if private:
+            msg["private"] = True
+        self.messages.append(msg)
         limit = config.HISTORY_TURNS * 2
         if len(self.messages) > limit:
             self.messages = self.messages[-limit:]
@@ -115,31 +120,42 @@ class Brain:
             except Exception as exc:  # Ollama still starting
                 log.info("Waiting for Ollama (%s)...", exc.__class__.__name__)
                 await asyncio.sleep(3)
-        wanted = config.LOCAL_MODEL if ":" in config.LOCAL_MODEL else f"{config.LOCAL_MODEL}:latest"
-        if wanted not in names:
-            log.info("Pulling %s (first run only, this can take several minutes)...", config.LOCAL_MODEL)
-            async with self._http.stream(
-                "POST", f"{config.OLLAMA_URL}/api/pull",
-                json={"model": config.LOCAL_MODEL}, timeout=None,
-            ) as resp:
-                last = ""
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    status = json.loads(line).get("status", "")
-                    if status != last:
-                        log.info("ollama pull: %s", status)
-                        last = status
+        await self.pull_model(config.LOCAL_MODEL, names)
         try:  # warm-up so the first real question is fast
             await self._http.post(
                 f"{config.OLLAMA_URL}/api/generate",
                 json={"model": config.LOCAL_MODEL, "prompt": "hi", "stream": False,
-                      "keep_alive": "24h", "options": {"num_predict": 1}},
+                      "keep_alive": "24h", "options": {"num_predict": 1, "num_ctx": LOCAL_CTX}},
             )
         except Exception as exc:
             log.warning("Warm-up failed: %s", exc)
         self.local_ready.set()
         log.info("Local model %s ready", config.LOCAL_MODEL)
+
+    async def pull_model(self, model: str, names: set | None = None) -> None:
+        """Download an Ollama model if it isn't on the Pi yet (first use only)."""
+        if names is None:
+            r = await self._http.get(f"{config.OLLAMA_URL}/api/tags")
+            r.raise_for_status()
+            names = {m.get("name") for m in r.json().get("models", [])}
+        wanted = model if ":" in model else f"{model}:latest"
+        if wanted in names:
+            return
+        log.info("Pulling %s (first run only, this can take several minutes)...", model)
+        async with self._http.stream("POST", f"{config.OLLAMA_URL}/api/pull", json={"model": model},
+                                     timeout=None) as resp:
+            resp.raise_for_status()
+            last = ""
+            async for line in resp.aiter_lines():
+                if not line:
+                    continue
+                msg = json.loads(line)
+                if msg.get("error"):
+                    raise RuntimeError(msg["error"])
+                status = msg.get("status", "")
+                if status != last:
+                    log.info("ollama pull %s: %s", model, status)
+                    last = status
 
     # --------------------------------------------------------------- answering
     async def ask_local(self, history: list[dict], extra: str = "") -> AsyncIterator[str]:
@@ -148,10 +164,11 @@ class Brain:
             return
         payload = {
             "model": config.LOCAL_MODEL,
-            "messages": [{"role": "system", "content": "\n\n".join(p for p in (local_system_prompt(), extra) if p)}] + history,
+            "messages": [{"role": "system", "content": "\n\n".join(p for p in (local_system_prompt(), extra) if p)}]
+                        + privacy.for_local(history),
             "stream": True,
             "keep_alive": "24h",
-            "options": {"num_predict": 200, "temperature": 0.6},
+            "options": {"num_predict": 200, "temperature": 0.6, "num_ctx": LOCAL_CTX},
         }
         async with self._http.stream("POST", f"{config.OLLAMA_URL}/api/chat", json=payload) as resp:
             resp.raise_for_status()
@@ -169,6 +186,13 @@ class Brain:
                          location: dict | None = None,
                          images: list[tuple[str, bytes]] | None = None) -> AsyncIterator[str]:
         """images: [(label, jpeg bytes)] attached to the latest question (camera photos)."""
+        # The privacy wall: private turns and anything marked private never leave the Pi.
+        history, extra, held = privacy.for_claude(history, extra)
+        log.info("Claude call: %d message(s), %d private turn(s) held back, no library or database text attached",
+                 len(history), held)
+        if not history or history[-1]["role"] != "user":
+            yield "Sorry, I lost track of the question. Please ask again."
+            return
         kwargs = {}
         if images and history and history[-1]["role"] == "user":
             content: list[dict] = []

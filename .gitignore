@@ -8,8 +8,9 @@ firmware/out/
 music/*
 !music/README.txt
 
-# your voice notes
+# your voice notes and private library
 voice-notes/
+library/
 
 # python
 __pycache__/
