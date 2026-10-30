@@ -6,7 +6,12 @@ from __future__ import annotations
 
 import asyncio
 import html
+import mimetypes
+import os
+import re
 import time
+import uuid
+from pathlib import Path
 from urllib.parse import quote
 
 from aiohttp import web
@@ -67,6 +72,15 @@ STYLE = """
   .note.ok { background:#0f2418; border:1px solid #25503a; } .note.bad { background:#2a1216; border:1px solid #4a2228; }
   details summary { cursor:pointer; color:var(--accent); font-size:14px; margin:6px 0; }
   .small { font-size:13px; color:var(--muted); }
+  a.t { color:var(--text); text-decoration:none; } a.t:hover { color:var(--accent); }
+  button.x, a.x { border:none; color:var(--muted); font-size:18px; padding:0 4px; text-decoration:none; line-height:1; }
+  button.x:hover { color:var(--bad); }
+  .drop { display:flex; align-items:center; justify-content:center; border:2px dashed var(--line); border-radius:12px;
+          padding:22px 12px; color:var(--muted); cursor:pointer; text-align:center; margin:0 0 4px; font-size:15px; }
+  .drop.on, .drop:hover { border-color:var(--accent); color:var(--text); }
+  .drop input { display:none; }
+  .bar { height:6px; background:#0f131a; border-radius:3px; margin-top:10px; overflow:hidden; }
+  .bar i { display:block; height:100%; width:0; background:var(--accent); transition:width .2s; }
 """
 
 STATUS_TAG = {"indexed": ("ok", "ready"), "failed": ("bad", "couldn't read"), "skipped": ("warn", "skipped"),
@@ -152,13 +166,22 @@ def add_routes(app: web.Application, lib: Library, databases: Databases) -> None
             if f["status"] == "indexed":
                 word = f'{f["chunks"]} passage{"s" if f["chunks"] != 1 else ""}'
             detail = f'<div class="detail">{_esc(f["detail"])}</div>' if f["detail"] else ""
-            items.append(f'<li><div class="file"><span class="t">{_esc(f["path"])}</span>'
+            if f["path"].startswith("voice notes/"):
+                name = f'<span class="t">{_esc(f["path"])}</span>'
+                remove = '<a class="x" href="/notes" title="Voice notes are managed on the Voice notes page">↗</a>'
+            else:
+                name = f'<a class="t" href="/library/file?path={quote(f["path"])}" target="_blank">{_esc(f["path"])}</a>'
+                remove = (f'<form method="post" action="/library/file/delete" class="inline" '
+                          f'onsubmit="return confirm(\'Delete {_esc(f["path"].replace(chr(39), "").replace(chr(92), ""))} from the Pi? '
+                          f'This can\\\'t be undone.\')"><input type="hidden" name="path" value="{_esc(f["path"])}">'
+                          f'<button class="x" title="Delete from the library">×</button></form>')
+            items.append(f'<li><div class="file">{name}'
                          f'<span class="k">{_esc(f["kind"])} · {_size(f["size"])}</span>'
-                         f'<span class="tag {cls}">{word}</span></div>{detail}</li>')
+                         f'<span class="tag {cls}">{word}</span>{remove}</div>{detail}</li>')
         for p in sorted(lib.queued)[:50]:
             items.append(f'<li><div class="file"><span class="t">{_esc(p)}</span><span class="tag">waiting</span></div></li>')
-        file_list = "".join(items) or ('<li class="small">No files yet. Copy documents, pictures or recordings into '
-                                       'the <b>library</b> folder on the Pi.</li>')
+        file_list = "".join(items) or ('<li class="small">No files yet. Add some above, or copy them into the '
+                                       '<b>library</b> folder on the Pi.</li>')
         more = f'<p class="small">Showing 500 of {len(files)} files.</p>' if len(files) > 500 else ""
         files_html = f"""<section><h2>Files</h2><ul>{file_list}</ul>{more}
           <details><summary>What Jarvis can read</summary><p class="small">Text and Markdown, PDF (scans too),
@@ -166,6 +189,39 @@ def add_routes(app: web.Application, lib: Library, databases: Databases) -> None
           (the text in them, plus a short description), sound recordings (transcribed), and your voice notes.
           Old .doc / .xls / .ppt files: save them in the newer format. Database files are skipped here: add them
           under Databases.</p></details></section>"""
+
+        folders = sorted({str(Path(f["path"]).parent) for f in files
+                          if not f["path"].startswith("voice notes/") and str(Path(f["path"]).parent) != "."})
+        folder_opts = "".join(f'<option value="{_esc(d)}">' for d in folders)
+        upload = f"""<section id="add"><h2>Add files</h2>
+          <form id="up" method="post" action="/library/upload" enctype="multipart/form-data">
+            <!-- the folder comes first, so the Pi knows where to put the files as they arrive -->
+            <label style="margin-top:0">Folder (optional)</label>
+            <input type="text" name="folder" list="folders" placeholder="e.g. home/insurance" maxlength="120"
+              autocapitalize="off" style="margin-bottom:10px"><datalist id="folders">{folder_opts}</datalist>
+            <label class="drop" id="drop"><input type="file" name="file" id="pick" multiple>
+              <span id="droptext">Drop files here, or <u>choose files</u></span></label>
+            <button class="go" id="upbtn" style="margin-top:8px;width:100%">Upload</button>
+            <div class="bar" id="bar" style="display:none"><i id="barfill"></i></div>
+          </form>
+          <p class="small" style="margin:8px 0 0">Up to {config.LIBRARY_MAX_MB:g} MB a file. Jarvis reads new files within a
+          minute. A file with the same name in the same folder is kept: the new one gets "(2)" added.</p></section>
+          <script>
+          (function(){{var f=document.getElementById('up'),pick=document.getElementById('pick'),drop=document.getElementById('drop'),
+            t=document.getElementById('droptext'),bar=document.getElementById('bar'),fill=document.getElementById('barfill');
+            function show(){{var n=pick.files.length;t.textContent=n?(n==1?pick.files[0].name:n+' files chosen'):'Drop files here, or choose files';}}
+            pick.addEventListener('change',show);
+            ['dragenter','dragover'].forEach(function(e){{drop.addEventListener(e,function(ev){{ev.preventDefault();drop.classList.add('on');}});}});
+            ['dragleave','drop'].forEach(function(e){{drop.addEventListener(e,function(ev){{ev.preventDefault();drop.classList.remove('on');}});}});
+            drop.addEventListener('drop',function(ev){{pick.files=ev.dataTransfer.files;show();}});
+            f.addEventListener('submit',function(ev){{if(!pick.files.length){{ev.preventDefault();t.textContent='Choose a file first';return;}}
+              if(!window.XMLHttpRequest||!window.FormData)return;ev.preventDefault();
+              var x=new XMLHttpRequest();x.open('POST',f.action);bar.style.display='';document.getElementById('upbtn').disabled=true;
+              x.upload.onprogress=function(e){{if(e.lengthComputable)fill.style.width=(100*e.loaded/e.total)+'%';}};
+              x.onload=function(){{location.href=x.responseURL||'/library';}};
+              x.onerror=function(){{t.textContent='Upload failed: is the Pi still reachable?';document.getElementById('upbtn').disabled=false;}};
+              x.send(new FormData(f));}});}})();
+          </script>"""
 
         conns = []
         for c in databases.conns:
@@ -239,6 +295,11 @@ def add_routes(app: web.Application, lib: Library, databases: Databases) -> None
           <script>function showFields(){{var k=document.getElementById('kind').value;var f=(k=='sqlite'||k=='json');
           document.getElementById('filefields').style.display=f?'':'none';document.getElementById('serverfields').style.display=f?'none':'';}}</script>"""
 
+        notice_top = ""
+        if req.query.get("fmsg"):
+            notice_top = f'<div class="note ok">{_esc(req.query["fmsg"])}</div>'
+        elif req.query.get("ferr"):
+            notice_top = f'<div class="note bad">{_esc(req.query["ferr"])}</div>'
         body = f"""<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">{'<meta http-equiv="refresh" content="20">' if (lib.queued or lib.busy) and not (q or test_id or try_id) else ''}
 <title>Jarvis library</title><style>{STYLE}</style></head><body><main>
@@ -246,7 +307,7 @@ def add_routes(app: web.Application, lib: Library, databases: Databases) -> None
 <nav><a href="/lists">Lists</a><a href="/notes">Voice notes</a><a class="on" href="/library">Library</a><a href="/wifi">Wi-Fi</a></nav>
 <div class="lock"><b>Private.</b> Your library and databases are only ever read by the AI running on this Pi.
 Nothing on this page, and no answer made from it, is sent to Claude, even if you say "use Claude".</div>
-{status}{search}{db_html}{files_html}
+{status}{notice_top}{upload}{search}{db_html}{files_html}
 <p class="small">Ask "Jarvis, check my files for the boiler warranty", "what do my documents say about the lease",
 or just ask: if your files clearly have the answer, Jarvis uses them.</p>
 </main></body></html>"""
@@ -315,6 +376,132 @@ or just ask: if your files clearly have the answer, Jarvis uses them.</p>
         cid = str(f.get("cid", ""))
         raise back(**{"try": str(f.get("qid", "")), "anchor": f"db-{cid}"})
 
+    # ------------------------------------------------------------ adding and removing files
+    def inside(rel: str) -> Path:
+        """A path in the library folder, or 404 (no '..', no voice notes, no hidden files)."""
+        rel = rel.strip().lstrip("/")
+        if not rel or rel.startswith("voice notes/") or any(p.startswith(".") for p in rel.split("/")):
+            raise web.HTTPNotFound()
+        root = lib.dir.resolve()
+        target = (root / rel).resolve()
+        if root not in target.parents:
+            raise web.HTTPNotFound()
+        return target
+
+    def own(path: Path) -> None:
+        """Give new files and folders to whoever owns the library folder (not root), so they can manage them too."""
+        try:
+            st = lib.dir.stat()
+            os.chown(path, st.st_uid, st.st_gid)
+        except (OSError, AttributeError):
+            pass
+
+    def back_files(**params) -> web.HTTPSeeOther:
+        query = "&".join(f"{k}={quote(str(v))}" for k, v in params.items())
+        return web.HTTPSeeOther("/library" + (f"?{query}" if query else "") + "#add")
+
+    async def upload(req: web.Request):
+        limit = int(config.LIBRARY_MAX_MB * 1024 * 1024)
+        try:
+            reader = await req.multipart()
+        except Exception:
+            raise back_files(ferr="That upload didn't arrive properly. Try again.")
+        folder = ""
+        saved, refused = [], []
+        while True:
+            part = await reader.next()
+            if part is None:
+                break
+            if part.name == "folder":
+                folder = clean_folder((await part.text())[:200])
+                continue
+            if part.name != "file" or not part.filename:
+                await part.release()
+                continue
+            name = clean_name(part.filename)
+            if not name:
+                refused.append(f"{part.filename} (not a usable file name)")
+                await part.release()
+                continue
+            try:
+                lib.dir.mkdir(parents=True, exist_ok=True)
+                dest_dir = inside(folder + "/x").parent if folder else lib.dir.resolve()
+            except web.HTTPNotFound:
+                raise back_files(ferr="That folder name isn't allowed.")
+            if not dest_dir.exists():
+                dest_dir.mkdir(parents=True, exist_ok=True)
+                d = dest_dir
+                while d != lib.dir.resolve():   # each new folder level belongs to the library's owner
+                    own(d)
+                    d = d.parent
+            tmp = dest_dir / f".upload-{uuid.uuid4().hex[:8]}"
+            size, too_big = 0, False
+            try:
+                with open(tmp, "wb") as fh:
+                    while True:
+                        chunk = await part.read_chunk(256 * 1024)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        if size > limit:
+                            too_big = True
+                            break
+                        fh.write(chunk)
+                if too_big:
+                    tmp.unlink(missing_ok=True)
+                    await part.release()
+                    refused.append(f"{name} (bigger than {config.LIBRARY_MAX_MB:g} MB)")
+                    continue
+                dest = unique(dest_dir / name)
+                os.replace(tmp, dest)
+                own(dest)
+                saved.append(dest.relative_to(lib.dir.resolve()).as_posix())
+            finally:
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+        if saved:
+            await lib.scan()   # shows them as waiting straight away
+        msg = ""
+        if len(saved) == 1:
+            msg = f"Added {saved[0]}. Jarvis will read it in a moment."
+        elif saved:
+            msg = f"Added {len(saved)} files. Jarvis will read them in a moment."
+        if refused:
+            err = "Not added: " + "; ".join(refused)
+            raise back_files(**({"fmsg": msg, "ferr": err} if msg else {"ferr": err}))
+        if not saved:
+            raise back_files(ferr="Choose at least one file.")
+        raise back_files(fmsg=msg)
+
+    async def delete_file(req: web.Request):
+        f = await req.post()
+        rel = str(f.get("path", ""))
+        target = inside(rel)
+        if not target.is_file():
+            raise back_files(ferr=f"{rel} isn't there any more.")
+        target.unlink()
+        lib.forget(target.relative_to(lib.dir.resolve()).as_posix())
+        d = target.parent   # tidy up folders left empty
+        while d != lib.dir.resolve() and d.is_dir() and not any(d.iterdir()):
+            d.rmdir()
+            d = d.parent
+        raise back_files(fmsg=f"Deleted {rel}. Jarvis has forgotten it.")
+
+    async def open_file(req: web.Request) -> web.StreamResponse:
+        target = inside(req.query.get("path", ""))
+        if not target.is_file():
+            raise web.HTTPNotFound()
+        ctype = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
+        inline = ctype.startswith(("image/", "audio/", "text/plain")) or ctype == "application/pdf"
+        disp = "inline" if inline else "attachment"
+        return web.FileResponse(target, headers={
+            "Content-Type": "text/plain; charset=utf-8" if ctype.startswith("text/") else ctype,
+            "Content-Disposition": f"{disp}; filename*=UTF-8''{quote(target.name)}",
+            "X-Content-Type-Options": "nosniff", "Content-Security-Policy": "sandbox"})
+
+    app.router.add_post("/library/upload", upload)
+    app.router.add_post("/library/file/delete", delete_file)
+    app.router.add_get("/library/file", open_file)
     app.router.add_get("/library", page)
     app.router.add_post("/library/scan", scan)
     app.router.add_post("/library/db/add", db_add)
@@ -329,3 +516,30 @@ def _sample_params(phrase: str) -> dict:
     """'Try it' on a phrase with {placeholders}: an empty value matches everything with LIKE '%' || :x || '%'."""
     import re
     return {name: "" for name in re.findall(r"\{(\w+)\}", phrase)}
+
+
+def clean_name(name: str) -> str:
+    """A safe file name: no folders, no hidden files, no odd characters."""
+    from urllib.parse import unquote
+    if re.search(r"%[0-9A-Fa-f]{2}", name):   # some clients percent-encode the name
+        name = unquote(name)
+    name = name.replace("\\", "/").split("/")[-1]
+    name = re.sub(r"[\x00-\x1f<>:\"|?*]", "", name).strip()
+    if not name or name.startswith("."):
+        return ""
+    return name.rstrip(". ")[:150]
+
+
+def clean_folder(folder: str) -> str:
+    parts = [clean_name(p) for p in folder.replace("\\", "/").split("/")]
+    return "/".join(p for p in parts if p and p != "..")[:120]
+
+
+def unique(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem, suffix = path.stem, path.suffix
+    n = 2
+    while (path.parent / f"{stem} ({n}){suffix}").exists():
+        n += 1
+    return path.parent / f"{stem} ({n}){suffix}"

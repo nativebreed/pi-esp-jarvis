@@ -262,8 +262,8 @@ The recorder screen needs the current firmware. On older firmware "take a note" 
 
 ### Your private library
 
-Copy documents, pictures and recordings into the **`library`** folder on the Pi (next to `music`), and Jarvis can answer
-from them. **Only the AI on the Pi ever reads them: nothing from your library or databases is sent to Claude**, even if
+Add documents, pictures and recordings on the **Library page** (drag them in from any computer or phone), or copy them
+into the **`library`** folder on the Pi (next to `music`), and Jarvis can answer from them. **Only the AI on the Pi ever reads them: nothing from your library or databases is sent to Claude**, even if
 you say "use Claude".
 
 | You say | What happens |
@@ -289,8 +289,11 @@ have a `{placeholder}`: "phone number for {name}" runs `... WHERE name LIKE '%' 
 Only single `SELECT` queries are accepted, they run read-only with a time limit, and passwords stay on the Pi; a database
 user that can only read is still the safest choice.
 
-**The Library page** (`http://raspi5.local:8000/library`) shows every file and whether it was read, lets you try a search and
-see the passages Jarvis would use (with their match score), and manages database connections.
+**The Library page** (`http://raspi5.local:8000/library`) uploads files (into a folder if you like, up to `LIBRARY_MAX_MB`
+each), shows every file and whether it was read, opens or deletes them (Jarvis forgets a deleted file at once), lets you
+try a search and see the passages Jarvis would use (with their match score), and manages database connections. Uploaded
+files belong to the same user as the `library` folder, so you can manage them on the Pi too. Because the page can add and
+delete files, setting `WEB_PASSWORD` is a good idea.
 
 **Privacy rule.** Library passages, database results and your "remember that…" memories are only given to the local model.
 Turns that used them are kept out of anything later sent to Claude, and the code that calls Claude strips anything marked
